@@ -810,8 +810,6 @@ int main(int argc, char *argv[]) {
     free(rgb_buffer_pool);
 
     queue_destroy(&player_state.full_q, free);
-    // queue_destroy(&player_state.empty_q, NULL); // Contains pointers to the pool, no free needed here
-    queue_destroy(&player_state.audio_q, (void (*)(void*))av_packet_free);
     avformat_close_input(&player_state.format_ctx);
 
     return 0;
