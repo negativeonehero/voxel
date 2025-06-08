@@ -438,6 +438,22 @@ typedef struct {
     GenericQueue audio_q; // Raw audio packets for the audio thread
 } PlayerState;
 
+static volatile bool* g_quit_flag_ptr = NULL;
+static GenericQueue* g_full_q_ptr = NULL;
+static GenericQueue* g_audio_q_ptr = NULL;
+static GenericQueue* g_empty_q_ptr = NULL;
+
+static void sigint_handler(int signum) {
+    (void)signum; // Unused
+    if (g_quit_flag_ptr) {
+        *g_quit_flag_ptr = true;
+    }
+    // Unblock any threads waiting on queues
+    if (g_full_q_ptr) queue_finish(g_full_q_ptr);
+    if (g_audio_q_ptr) queue_finish(g_audio_q_ptr);
+    if (g_empty_q_ptr) queue_finish(g_empty_q_ptr);
+}
+
 /**
  * The decode thread's job is to:
  * 1. Read packets (video or audio) from the media file.
@@ -533,7 +549,7 @@ void* audio_thread_func(void* arg) {
 
     pa_sample_spec pa_ss = { .format = PA_SAMPLE_S16LE, .channels = a_codec_ctx->ch_layout.nb_channels, .rate = a_codec_ctx->sample_rate };
     int pa_error;
-    pa_simple* pa_s = pa_simple_new(NULL, "term-player", PA_STREAM_PLAYBACK, NULL, "playback", &pa_ss, NULL, NULL, &pa_error);
+    pa_simple* pa_s = pa_simple_new(NULL, "voxel", PA_STREAM_PLAYBACK, NULL, "playback", &pa_ss, NULL, NULL, &pa_error);
     if (!pa_s) { fprintf(stderr, "ERROR: pa_simple_new() failed: %s\n", pa_strerror(pa_error)); s->quit = true; return NULL; }
 
     struct SwrContext* swr_ctx = NULL;
@@ -594,13 +610,17 @@ int compare_doubles(const void *a, const void *b) {
 void print_usage(const char *prog_name) {
     fprintf(stderr, "Usage: %s [options] <video_path>\n", prog_name);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -w WIDTHxHEIGHT  Set a specific render PIXEL size.\n");
+    fprintf(stderr, "  -w WIDTHxHEIGHT  Set a specific render PIXEL size\n");
+    fprintf(stderr, "                     By default, the pixel size is set based on the terminal size\n");
+    fprintf(stderr, "                     and the high-resolution mode used.\n");
     fprintf(stderr, "  -h MODE          Enable high-resolution mode. MODE can be:\n");
-    fprintf(stderr, "                     half:     2 vertical pixels per char (1x2)\n");
-    fprintf(stderr, "                     quadrant: 4 pixels per char (2x2), optimal\n");
-    fprintf(stderr, "  -t TOLERANCE     Perceptual color tolerance (e.g., 10-100).\n");
-    fprintf(stderr, "  -u               Unlimited mode. Render frames as fast as possible, disabling audio.\n");
-    fprintf(stderr, "  -s               Show playback statistics upon completion.\n");
+    fprintf(stderr, "                     half:     use half blocks for 2x vertical resolution\n");
+    fprintf(stderr, "                     quadrant: use quadrant blocks for 2x vertical/horizontal resolution\n");
+    fprintf(stderr, "  -t TOLERANCE     Perceptual color tolerance\n");
+    fprintf(stderr, "                     Higher number means lower color quality and lower bandwidth.\n");
+    fprintf(stderr, "  -a               Adaptive quality mode, overrides -t\n");
+    fprintf(stderr, "  -u               Render frames as fast as possible, disabling audio\n");
+    fprintf(stderr, "  -s               Show playback statistics upon completion\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -608,6 +628,7 @@ int main(int argc, char *argv[]) {
     int custom_w = 0, custom_h = 0;
     bool unlimited_mode = false;
     bool show_stats = false;
+    bool adaptive_quality_mode = false;
 
     // --- Argument Parsing ---
     for (int i = 1; i < argc; ++i) {
@@ -616,10 +637,14 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "-t") == 0) { if (++i < argc) g_render_tolerance_sq = atoi(argv[i]); else { print_usage(argv[0]); return 1; } }
         else if (strcmp(argv[i], "-u") == 0) unlimited_mode = true;
         else if (strcmp(argv[i], "-s") == 0) show_stats = true;
+        else if (strcmp(argv[i], "-a") == 0) adaptive_quality_mode = true;
         else if (argv[i][0] == '-') { fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]); print_usage(argv[0]); return 1; }
         else { if (video_path) { fprintf(stderr, "ERROR: Multiple video paths specified.\n"); return 1; } video_path = argv[i]; }
     }
-    if (!video_path) { fprintf(stderr, "voxel version 1.0.0\n"); print_usage(argv[0]); return 1; }
+    if (!video_path) { fprintf(stderr, "voxel version 1.0.1\n"); print_usage(argv[0]); return 1; }
+
+    av_log_set_level(AV_LOG_ERROR);
+    signal(SIGINT, sigint_handler);
 
     // --- Player State and FFmpeg Initialization ---
     PlayerState player_state = {0};
@@ -628,6 +653,11 @@ int main(int argc, char *argv[]) {
     queue_init(&player_state.full_q);
     queue_init(&player_state.empty_q);
     queue_init(&player_state.audio_q);
+
+    g_quit_flag_ptr = &player_state.quit;
+    g_full_q_ptr = &player_state.full_q;
+    g_audio_q_ptr = &player_state.audio_q;
+    g_empty_q_ptr = &player_state.empty_q;
 
     if (avformat_open_input(&player_state.format_ctx, video_path, NULL, NULL) != 0) { fprintf(stderr, "ERROR: Could not open video file '%s'\n", video_path); return 1; }
     if (avformat_find_stream_info(player_state.format_ctx, NULL) < 0) { fprintf(stderr, "ERROR: Could not find stream info for '%s'\n", video_path); return 1; }
@@ -662,6 +692,17 @@ int main(int argc, char *argv[]) {
     if (render_w < 1) render_w = 1; if (render_h < 1) render_h = 1;
     player_state.render_w = render_w;
     player_state.render_h = render_h;
+
+    double target_frame_time = 0.0;
+    if (adaptive_quality_mode && !unlimited_mode) {
+        AVStream* v_stream = player_state.format_ctx->streams[player_state.video_stream_idx];
+        double frame_rate = av_q2d(v_stream->avg_frame_rate);
+        if (frame_rate > 0) {
+            target_frame_time = 1.0 / frame_rate;
+        } else {
+            adaptive_quality_mode = false; // Can't do adaptive without a frame rate
+        }
+    }
 
     // --- Create Buffer Pool and Threading Resources ---
     size_t rgb_buffer_size = render_w * render_h * 3;
@@ -715,7 +756,9 @@ int main(int argc, char *argv[]) {
         }
 
         struct timespec frame_start_ts, frame_end_ts;
-        if (show_stats) clock_gettime(CLOCK_MONOTONIC, &frame_start_ts);
+        bool should_time_frame = show_stats || (adaptive_quality_mode && !unlimited_mode);
+
+        if (should_time_frame) clock_gettime(CLOCK_MONOTONIC, &frame_start_ts);
 
         g_cursor_row = 0; g_cursor_col = 0;
         switch (g_render_mode) {
@@ -727,12 +770,24 @@ int main(int argc, char *argv[]) {
         buffer_flush();
         frame_count++;
 
-        if (show_stats) {
+        if (should_time_frame) {
             clock_gettime(CLOCK_MONOTONIC, &frame_end_ts);
             double render_duration = get_time_diff(&frame_start_ts, &frame_end_ts);
-            total_render_time += render_duration;
-            if (frame_count <= MAX_RENDER_TIMES) {
-                render_times[frame_count - 1] = render_duration;
+
+            if (adaptive_quality_mode && !unlimited_mode) {
+                if (render_duration > target_frame_time * 1.10) {
+                    g_render_tolerance_sq += 10;
+                } else if (render_duration < target_frame_time * 0.90) {
+                    g_render_tolerance_sq -= 10;
+                    if (g_render_tolerance_sq < 0) g_render_tolerance_sq = 0;
+                }
+            }
+
+            if (show_stats) {
+                total_render_time += render_duration;
+                if (frame_count <= MAX_RENDER_TIMES) {
+                    render_times[frame_count - 1] = render_duration;
+                }
             }
         }
 
@@ -770,23 +825,26 @@ int main(int argc, char *argv[]) {
         if (g_render_mode == MODE_HALF) term_h /= 2;
         else if (g_render_mode == MODE_QUADRANT) { term_w /= 2; term_h /= 2; }
         printf("Pixel/Char Size:      %dpx W x %dpx H -> %dch W x %dch H\n", render_w, render_h, term_w, term_h);
-        printf("Render Tolerance:     %d\n", g_render_tolerance_sq);
+        if (adaptive_quality_mode)
+            printf("Render Tolerance:     Adaptive\n");
+        else
+            printf("Render Tolerance:     %d\n", g_render_tolerance_sq);
         printf("Playback Speed:       %s\n", unlimited_mode ? "Unlimited" : "Normal");
 
         if (frame_count > 0 && total_duration > 0) {
             if (!unlimited_mode) {
                 double avg_fps = frame_count / total_duration;
                 printf("Average FPS:          %.2f FPS\n", avg_fps);
-            }
+            } else {
+                double avg_render_ms = (total_render_time / frame_count) * 1000.0;
+                printf("Average render time:  %.2f ms (%.2f FPS equiv.)\n", avg_render_ms, 1000.0 / avg_render_ms);
 
-            double avg_render_ms = (total_render_time / frame_count) * 1000.0;
-            printf("Average render time:  %.2f ms (%.2f FPS equiv.)\n", avg_render_ms, 1000.0 / avg_render_ms);
-
-            if (frame_count > 10) {
-                size_t num_times = frame_count < MAX_RENDER_TIMES ? frame_count : MAX_RENDER_TIMES;
-                qsort(render_times, num_times, sizeof(double), compare_doubles);
-                double low_percentile_time_s = render_times[(int)(num_times * 0.99)];
-                printf("1%% low render time:   %.2f ms (%.2f FPS equiv.)\n", low_percentile_time_s * 1000.0, 1.0 / low_percentile_time_s);
+                if (frame_count > 10) {
+                    size_t num_times = frame_count < MAX_RENDER_TIMES ? frame_count : MAX_RENDER_TIMES;
+                    qsort(render_times, num_times, sizeof(double), compare_doubles);
+                    double low_percentile_time_s = render_times[(int)(num_times * 0.99)];
+                    printf("1%% low render time:   %.2f ms (%.2f FPS equiv.)\n", low_percentile_time_s * 1000.0, 1.0 / low_percentile_time_s);
+                }
             }
 
             double term_bw_mbps = (g_terminal_bytes_written / total_duration) * 8.0 / (1024 * 1024);
