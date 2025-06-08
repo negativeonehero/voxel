@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 
 // FFmpeg (libav) libraries
 #include <libavcodec/avcodec.h>
@@ -67,6 +68,8 @@ static const int BITS_SET[] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 // Global config set by command-line arguments
 static RenderMode g_render_mode = MODE_FULL;
 static int g_render_tolerance_sq = 0;
+
+static volatile sig_atomic_t g_interrupted = 0;
 
 // =====================================================================================
 // == Terminal I/O and State
@@ -344,7 +347,7 @@ void render_frame_quadrant(int w, int h, const uint8_t* rgb, const uint8_t* prev
 // == Threading Primitives (Generic Queue)
 // =====================================================================================
 
-#define QUEUE_CAPACITY 8
+#define QUEUE_CAPACITY 60
 typedef struct {
     void* items[QUEUE_CAPACITY];
     int size;
@@ -431,27 +434,19 @@ typedef struct {
     // A/V sync
     volatile double audio_clock;
     volatile bool quit;
+    pa_simple *pa_s;
+    double video_start_time;
 
     // Queues for thread communication
-    GenericQueue full_q;  // Scaled RGB buffers ready for rendering
-    GenericQueue empty_q; // Buffers ready to be filled by decoder
-    GenericQueue audio_q; // Raw audio packets for the audio thread
+    GenericQueue full_q;      // Populated QueuedFrame objects ready for rendering
+    GenericQueue empty_q;     // RGB buffers ready to be filled by decoder
+    GenericQueue frame_pool_q; // Empty QueuedFrame objects ready for reuse
+    GenericQueue audio_q;     // Raw audio packets for the audio thread
 } PlayerState;
-
-static volatile bool* g_quit_flag_ptr = NULL;
-static GenericQueue* g_full_q_ptr = NULL;
-static GenericQueue* g_audio_q_ptr = NULL;
-static GenericQueue* g_empty_q_ptr = NULL;
 
 static void sigint_handler(int signum) {
     (void)signum; // Unused
-    if (g_quit_flag_ptr) {
-        *g_quit_flag_ptr = true;
-    }
-    // Unblock any threads waiting on queues
-    if (g_full_q_ptr) queue_finish(g_full_q_ptr);
-    if (g_audio_q_ptr) queue_finish(g_audio_q_ptr);
-    if (g_empty_q_ptr) queue_finish(g_empty_q_ptr);
+    g_interrupted = 1;
 }
 
 /**
@@ -481,7 +476,7 @@ void* decode_thread_func(void* arg) {
     AVFrame* dec_frame = av_frame_alloc();
     AVRational time_base = v_stream->time_base;
 
-    while (!s->quit && av_read_frame(s->format_ctx, pkt) >= 0) {
+    while (!s->quit && !g_interrupted && av_read_frame(s->format_ctx, pkt) >= 0) {
         if (pkt->stream_index == s->video_stream_idx) {
             if (avcodec_send_packet(v_codec_ctx, pkt) == 0) {
                 while (true) {
@@ -492,10 +487,9 @@ void* decode_thread_func(void* arg) {
                     uint8_t *rgb_buffer = NULL;
                     if (queue_get(&s->empty_q, (void**)&rgb_buffer) != 0) break;
 
-                    QueuedFrame* q_frame = malloc(sizeof(QueuedFrame));
-                    if (!q_frame) {
+                    QueuedFrame* q_frame = NULL;
+                    if (queue_get(&s->frame_pool_q, (void**)&q_frame) != 0) {
                         queue_put(&s->empty_q, rgb_buffer);
-                        s->quit = true;
                         break;
                     }
                     q_frame->rgb_data = rgb_buffer;
@@ -505,7 +499,7 @@ void* decode_thread_func(void* arg) {
                     if (queue_put(&s->full_q, q_frame) != 0) {
                         // Main thread quit, clean up what we just allocated
                         queue_put(&s->empty_q, q_frame->rgb_data);
-                        free(q_frame);
+                        queue_put(&s->frame_pool_q, q_frame);
                         break;
                     }
                     av_frame_unref(dec_frame);
@@ -518,7 +512,7 @@ void* decode_thread_func(void* arg) {
             }
         }
         av_packet_unref(pkt);
-        if (s->quit) break;
+        if (s->quit || g_interrupted) break;
     }
 
     queue_finish(&s->full_q);
@@ -551,6 +545,7 @@ void* audio_thread_func(void* arg) {
     int pa_error;
     pa_simple* pa_s = pa_simple_new(NULL, "voxel", PA_STREAM_PLAYBACK, NULL, "playback", &pa_ss, NULL, NULL, &pa_error);
     if (!pa_s) { fprintf(stderr, "ERROR: pa_simple_new() failed: %s\n", pa_strerror(pa_error)); s->quit = true; return NULL; }
+    s->pa_s = pa_s; // Share the handle with the main thread
 
     struct SwrContext* swr_ctx = NULL;
     swr_alloc_set_opts2(&swr_ctx, &a_codec_ctx->ch_layout, AV_SAMPLE_FMT_S16, pa_ss.rate, &a_codec_ctx->ch_layout, a_codec_ctx->sample_fmt, a_codec_ctx->sample_rate, 0, NULL);
@@ -559,32 +554,54 @@ void* audio_thread_func(void* arg) {
     AVFrame* frame = av_frame_alloc();
     AVPacket* pkt;
 
+    // --- Pre-allocate a reusable buffer for resampled audio data ---
+    const int MAX_SAMPLES_PER_FRAME = 4096;
+    int resampled_buffer_size = av_samples_get_buffer_size(NULL, pa_ss.channels, MAX_SAMPLES_PER_FRAME, AV_SAMPLE_FMT_S16, 1);
+    uint8_t *resampled_buffer = av_malloc(resampled_buffer_size);
+    if (!resampled_buffer) {
+        fprintf(stderr, "ERROR: Failed to allocate audio resample buffer.\n");
+        s->quit = true;
+        swr_free(&swr_ctx);
+        avcodec_free_context(&a_codec_ctx);
+        av_frame_free(&frame);
+        pa_simple_free(pa_s);
+        return NULL;
+    }
+
     // --- Main Packet Processing Loop ---
     while (!s->quit && queue_get(&s->audio_q, (void**)&pkt) == 0) {
         if (avcodec_send_packet(a_codec_ctx, pkt) == 0) {
             while (avcodec_receive_frame(a_codec_ctx, frame) == 0) {
-                uint8_t *resampled_buffer = NULL;
-                av_samples_alloc(&resampled_buffer, NULL, pa_ss.channels, frame->nb_samples, AV_SAMPLE_FMT_S16, 0);
-                swr_convert(swr_ctx, &resampled_buffer, frame->nb_samples, (const uint8_t **)frame->data, frame->nb_samples);
-                pa_simple_write(pa_s, resampled_buffer, av_samples_get_buffer_size(NULL, pa_ss.channels, frame->nb_samples, AV_SAMPLE_FMT_S16, 1), &pa_error);
-                av_freep(&resampled_buffer);
+                // Safety check: ensure our pre-allocated buffer is large enough.
+                if (frame->nb_samples > MAX_SAMPLES_PER_FRAME) {
+                    fprintf(stderr, "Warning: Audio frame has %d samples, exceeding pre-allocated max of %d. Skipping.\n", frame->nb_samples, MAX_SAMPLES_PER_FRAME);
+                    continue;
+                }
+
+                // Resample directly into our reusable buffer.
+                int out_samples = swr_convert(swr_ctx, &resampled_buffer, frame->nb_samples, (const uint8_t **)frame->data, frame->nb_samples);
+                int out_buffer_size = av_samples_get_buffer_size(NULL, pa_ss.channels, out_samples, AV_SAMPLE_FMT_S16, 1);
+                pa_simple_write(pa_s, resampled_buffer, out_buffer_size, &pa_error);
                 s->audio_clock += (double)frame->nb_samples / a_codec_ctx->sample_rate;
             }
         }
         av_packet_free(&pkt);
     }
 
+    // --- Flush the remaining frames from the codec ---
     avcodec_send_packet(a_codec_ctx, NULL);
     while (avcodec_receive_frame(a_codec_ctx, frame) == 0) {
-        uint8_t *resampled_buffer = NULL;
-        av_samples_alloc(&resampled_buffer, NULL, pa_ss.channels, frame->nb_samples, AV_SAMPLE_FMT_S16, 0);
-        swr_convert(swr_ctx, &resampled_buffer, frame->nb_samples, (const uint8_t **)frame->data, frame->nb_samples);
-        pa_simple_write(pa_s, resampled_buffer, av_samples_get_buffer_size(NULL, pa_ss.channels, frame->nb_samples, AV_SAMPLE_FMT_S16, 1), &pa_error);
-        av_freep(&resampled_buffer);
+        if (frame->nb_samples > MAX_SAMPLES_PER_FRAME) continue; // Same safety check
+        int out_samples = swr_convert(swr_ctx, &resampled_buffer, frame->nb_samples, (const uint8_t **)frame->data, frame->nb_samples);
+        int out_buffer_size = av_samples_get_buffer_size(NULL, pa_ss.channels, out_samples, AV_SAMPLE_FMT_S16, 1);
+        pa_simple_write(pa_s, resampled_buffer, out_buffer_size, &pa_error);
         s->audio_clock += (double)frame->nb_samples / a_codec_ctx->sample_rate;
     }
 
+    // --- Free resources ---
+    av_free(resampled_buffer);
     pa_simple_free(pa_s);
+    s->pa_s = NULL;
     swr_free(&swr_ctx);
     avcodec_free_context(&a_codec_ctx);
     av_frame_free(&frame);
@@ -613,7 +630,7 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -w WIDTHxHEIGHT  Set a specific render PIXEL size\n");
     fprintf(stderr, "                     By default, the pixel size is set based on the terminal size\n");
     fprintf(stderr, "                     and the high-resolution mode used.\n");
-    fprintf(stderr, "  -h MODE          Enable high-resolution mode. MODE can be:\n");
+    fprintf(stderr, "  -m MODE          Enable high-resolution mode. MODE can be:\n");
     fprintf(stderr, "                     half:     use half blocks for 2x vertical resolution\n");
     fprintf(stderr, "                     quadrant: use quadrant blocks for 2x vertical/horizontal resolution\n");
     fprintf(stderr, "  -t TOLERANCE     Perceptual color tolerance\n");
@@ -621,6 +638,30 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -a               Adaptive quality mode, overrides -t\n");
     fprintf(stderr, "  -u               Render frames as fast as possible, disabling audio\n");
     fprintf(stderr, "  -s               Show playback statistics upon completion\n");
+    fprintf(stderr, "  -h               Show this help message\n");
+    fprintf(stderr, "  -v               Show software version\n");
+}
+
+static inline double get_master_clock(PlayerState *s) {
+    if (s->audio_stream_idx != -1) {
+        if (s->pa_s) {
+            int pa_error;
+            useconds_t latency = pa_simple_get_latency(s->pa_s, &pa_error);
+            if (latency == (useconds_t)-1) {
+                return s->audio_clock;
+            }
+            return s->audio_clock - (double)latency / 1e6;
+        }
+        return s->audio_clock;
+    } else {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double current_time = ts.tv_sec + ts.tv_nsec / 1e9;
+        if (s->video_start_time < 0) {
+            s->video_start_time = current_time;
+        }
+        return current_time - s->video_start_time;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -631,17 +672,57 @@ int main(int argc, char *argv[]) {
     bool adaptive_quality_mode = false;
 
     // --- Argument Parsing ---
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-w") == 0) { if (++i < argc) { if (sscanf(argv[i], "%dx%d", &custom_w, &custom_h) != 2 || custom_w <= 0 || custom_h <= 0) { fprintf(stderr, "ERROR: Invalid size format for -w.\n"); return 1; } } else { print_usage(argv[0]); return 1; } }
-        else if (strcmp(argv[i], "-h") == 0) { if (++i < argc) { if (strcmp(argv[i], "half") == 0) g_render_mode = MODE_HALF; else if (strcmp(argv[i], "quadrant") == 0) g_render_mode = MODE_QUADRANT; else { fprintf(stderr, "ERROR: Unknown high-res mode '%s'\n", argv[i]); return 1; } } else { print_usage(argv[0]); return 1; } }
-        else if (strcmp(argv[i], "-t") == 0) { if (++i < argc) g_render_tolerance_sq = atoi(argv[i]); else { print_usage(argv[0]); return 1; } }
-        else if (strcmp(argv[i], "-u") == 0) unlimited_mode = true;
-        else if (strcmp(argv[i], "-s") == 0) show_stats = true;
-        else if (strcmp(argv[i], "-a") == 0) adaptive_quality_mode = true;
-        else if (argv[i][0] == '-') { fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]); print_usage(argv[0]); return 1; }
-        else { if (video_path) { fprintf(stderr, "ERROR: Multiple video paths specified.\n"); return 1; } video_path = argv[i]; }
+    int opt;
+    while ((opt = getopt(argc, argv, "w:m:t:aushv")) != -1) {
+        switch (opt) {
+            case 'w':
+                if (sscanf(optarg, "%dx%d", &custom_w, &custom_h) != 2 || custom_w <= 0 || custom_h <= 0) {
+                    fprintf(stderr, "ERROR: Invalid size format for -w. Use WIDTHxHEIGHT.\n");
+                    return 1;
+                }
+                break;
+            case 'm':
+                if (strcmp(optarg, "half") == 0) {
+                    g_render_mode = MODE_HALF;
+                } else if (strcmp(optarg, "quadrant") == 0) {
+                    g_render_mode = MODE_QUADRANT;
+                } else {
+                    fprintf(stderr, "ERROR: Unknown high-res mode '%s'. Use 'half' or 'quadrant'.\n", optarg);
+                    return 1;
+                }
+                break;
+            case 't':
+                g_render_tolerance_sq = atoi(optarg);
+                break;
+            case 'u':
+                unlimited_mode = true;
+                break;
+            case 's':
+                show_stats = true;
+                break;
+            case 'a':
+                adaptive_quality_mode = true;
+                break;
+            case 'v':
+                fprintf(stderr, "voxel version 1.0.1\n");
+                return 1;
+            case 'h':
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
     }
-    if (!video_path) { fprintf(stderr, "voxel version 1.0.1\n"); print_usage(argv[0]); return 1; }
+
+    if (optind >= argc) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    video_path = argv[optind];
+
+    if (optind < argc - 1) {
+        fprintf(stderr, "ERROR: Multiple video paths specified. Only one is allowed.\n");
+        return 1;
+    }
 
     av_log_set_level(AV_LOG_ERROR);
     signal(SIGINT, sigint_handler);
@@ -652,12 +733,8 @@ int main(int argc, char *argv[]) {
     player_state.audio_stream_idx = -1;
     queue_init(&player_state.full_q);
     queue_init(&player_state.empty_q);
+    queue_init(&player_state.frame_pool_q);
     queue_init(&player_state.audio_q);
-
-    g_quit_flag_ptr = &player_state.quit;
-    g_full_q_ptr = &player_state.full_q;
-    g_audio_q_ptr = &player_state.audio_q;
-    g_empty_q_ptr = &player_state.empty_q;
 
     if (avformat_open_input(&player_state.format_ctx, video_path, NULL, NULL) != 0) { fprintf(stderr, "ERROR: Could not open video file '%s'\n", video_path); return 1; }
     if (avformat_find_stream_info(player_state.format_ctx, NULL) < 0) { fprintf(stderr, "ERROR: Could not find stream info for '%s'\n", video_path); return 1; }
@@ -711,6 +788,11 @@ int main(int argc, char *argv[]) {
         rgb_buffer_pool[i] = malloc(rgb_buffer_size);
         queue_put(&player_state.empty_q, rgb_buffer_pool[i]);
     }
+    QueuedFrame** frame_pool = malloc(QUEUE_CAPACITY * sizeof(QueuedFrame*));
+    for (int i = 0; i < QUEUE_CAPACITY; ++i) {
+        frame_pool[i] = malloc(sizeof(QueuedFrame));
+        queue_put(&player_state.frame_pool_q, frame_pool[i]);
+    }
     uint8_t *prev_rgb_buffer = malloc(rgb_buffer_size);
     memset(prev_rgb_buffer, 0, rgb_buffer_size);
 
@@ -720,6 +802,7 @@ int main(int argc, char *argv[]) {
 
     // --- Start Threads ---
     pthread_t decode_tid, audio_tid;
+    player_state.video_start_time = -1.0;
     pthread_create(&decode_tid, NULL, decode_thread_func, &player_state);
     if (player_state.audio_stream_idx != -1) {
         pthread_create(&audio_tid, NULL, audio_thread_func, &player_state);
@@ -735,18 +818,19 @@ int main(int argc, char *argv[]) {
     getrusage(RUSAGE_SELF, &start_usage);
 
     QueuedFrame* q_frame;
-    while (!player_state.quit && queue_get(&player_state.full_q, (void**)&q_frame) == 0) {
-        if (q_frame->pts > 0 && player_state.audio_stream_idx != -1) {
-            double delay = q_frame->pts - player_state.audio_clock;
+    while (!g_interrupted && queue_get(&player_state.full_q, (void**)&q_frame) == 0) {
+        if (q_frame->pts > 0 && !unlimited_mode) {
+            double master_clock = get_master_clock(&player_state);
+            double delay = q_frame->pts - master_clock;
 
-            // If frame is too far behind, drop it and get the next one.
-            if (delay < -0.1) { // 100ms threshold for dropping
+            // Frame is too late, drop it and get the next one.
+            if (delay < -0.1) {
                 queue_put(&player_state.empty_q, q_frame->rgb_data);
-                free(q_frame);
+                queue_put(&player_state.frame_pool_q, q_frame);
                 continue;
             }
 
-            // If frame is slightly ahead, wait.
+            // Frame is early, wait
             if (delay > 0.0) {
                 struct timespec sleep_ts = {0};
                 sleep_ts.tv_sec = (time_t)delay;
@@ -791,9 +875,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Return the RGB buffer to the empty pool and free the container struct
+        // Return the RGB buffer and the frame container to their respective pools
         queue_put(&player_state.empty_q, q_frame->rgb_data);
-        free(q_frame);
+        queue_put(&player_state.frame_pool_q, q_frame);
     }
     player_state.quit = true; // Signal other threads to exit
 
@@ -801,10 +885,15 @@ int main(int argc, char *argv[]) {
     getrusage(RUSAGE_SELF, &end_usage);
 
     // --- Cleanup and Shutdown ---
-    queue_finish(&player_state.empty_q); // Ensure decode thread doesn't block
-    pthread_join(decode_tid, NULL);
+    queue_finish(&player_state.full_q);
+    queue_finish(&player_state.empty_q);
     if (player_state.audio_stream_idx != -1) {
         queue_finish(&player_state.audio_q);
+    }
+
+    // Now join the threads
+    pthread_join(decode_tid, NULL);
+    if (player_state.audio_stream_idx != -1) {
         pthread_join(audio_tid, NULL);
     }
 
@@ -864,10 +953,12 @@ int main(int argc, char *argv[]) {
     free(render_times);
     for (int i = 0; i < QUEUE_CAPACITY; ++i) {
         free(rgb_buffer_pool[i]);
+        free(frame_pool[i]);
     }
     free(rgb_buffer_pool);
+    free(frame_pool);
 
-    queue_destroy(&player_state.full_q, free);
+    queue_destroy(&player_state.full_q, NULL);
     avformat_close_input(&player_state.format_ctx);
 
     return 0;
