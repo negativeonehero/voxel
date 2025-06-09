@@ -109,6 +109,35 @@ void buffer_append(const char *format, ...) {
     }
 }
 
+void buffer_append_run(const char* s, int count) {
+    if (count <= 0) return;
+
+    size_t len = strlen(s);
+    if (len == 0) return;
+
+    if (len * count >= OUTPUT_BUFFER_SIZE) {
+        for (int i = 0; i < count; ++i) {
+            buffer_append("%s", s);
+        }
+        return;
+    }
+
+    if (g_buffer_pos + (len * count) >= OUTPUT_BUFFER_SIZE) {
+        buffer_flush();
+    }
+
+    char* dest = g_output_buffer + g_buffer_pos;
+    if (len == 1) {
+        memset(dest, s[0], count);
+    } else {
+        for (int i = 0; i < count; i++) {
+            memcpy(dest, s, len);
+            dest += len;
+        }
+    }
+    g_buffer_pos += len * count;
+}
+
 // =====================================================================================
 // == Terminal Rendering Logic
 // =====================================================================================
@@ -204,7 +233,7 @@ void render_frame_full_block(int w, int h, const uint8_t* current_rgb, const uin
                 if (!are_colors_similar(cur_p, &current_rgb[(y * w + i) * 3])) break;
                 run_len++;
             }
-            for (int i = 0; i < run_len; ++i) buffer_append(" ");
+            buffer_append_run(" ", run_len);
             g_cursor_col += run_len;
             x += run_len;
         }
@@ -244,7 +273,7 @@ void render_frame_half_block(int w, int h, const uint8_t* rgb, const uint8_t* pr
                 if (!are_colors_similar(top_p, &rgb[((y * 2) * w + i) * 3]) || !are_colors_similar(bot_p, &rgb[((y * 2 + 1) * w + i) * 3])) break;
                 run_len++;
             }
-            for (int i = 0; i < run_len; ++i) buffer_append("%s", char_to_print);
+            buffer_append_run(char_to_print, run_len);
             g_cursor_col += run_len;
             x += run_len;
         }
@@ -304,43 +333,65 @@ void get_optimal_quadrant(const uint8_t* px[4], QuadrantCell* cell) {
 
 void render_frame_quadrant(int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame) {
     int char_w = w / 2, char_h = h / 2;
+
+    QuadrantCell *cell_row = malloc(char_w * sizeof(QuadrantCell));
+    if (!cell_row) return;
+
     for (int y = 0; y < char_h; ++y) {
-        for (int x = 0; x < char_w; ) {
+        bool row_has_changes = false;
+        for (int x = 0; x < char_w; ++x) {
             const uint8_t* px_ptr[4] = {
-                &rgb[((y * 2) * w + x * 2) * 3], &rgb[((y * 2) * w + x * 2 + 1) * 3],
-                &rgb[((y * 2 + 1) * w + x * 2) * 3], &rgb[((y * 2 + 1) * w + x * 2 + 1) * 3]
+                &rgb[((y * 2) * w + x * 2) * 3],
+                &rgb[((y * 2) * w + x * 2 + 1) * 3],
+                &rgb[((y * 2 + 1) * w + x * 2) * 3],
+                &rgb[((y * 2 + 1) * w + x * 2 + 1) * 3]
             };
-            if (frame > 0 && are_colors_similar(px_ptr[0], &prev_rgb[((y * 2) * w + x * 2) * 3]) &&
+            if (frame > 0 &&
+                are_colors_similar(px_ptr[0], &prev_rgb[((y * 2) * w + x * 2) * 3]) &&
                 are_colors_similar(px_ptr[1], &prev_rgb[((y * 2) * w + x * 2 + 1) * 3]) &&
                 are_colors_similar(px_ptr[2], &prev_rgb[((y * 2 + 1) * w + x * 2) * 3]) &&
-                are_colors_similar(px_ptr[3], &prev_rgb[((y * 2 + 1) * w + x * 2 + 1) * 3])) {
+                are_colors_similar(px_ptr[3], &prev_rgb[((y * 2 + 1) * w + x * 2 + 1) * 3]))
+            {
+                cell_row[x].mask = -1;
+                continue;
+            }
+
+            row_has_changes = true;
+            get_optimal_quadrant(px_ptr, &cell_row[x]);
+        }
+
+        if (!row_has_changes) {
+            continue;
+        }
+
+        for (int x = 0; x < char_w; ) {
+            if (cell_row[x].mask == -1) {
                 x++;
                 continue;
             }
 
-            QuadrantCell current_cell;
-            get_optimal_quadrant(px_ptr, &current_cell);
             move_cursor(y + 1, x + 1);
-            set_colors(current_cell.fg, current_cell.bg);
+
+            set_colors(cell_row[x].fg, cell_row[x].bg);
+            const char* char_to_print = QUADRANT_CHARS[cell_row[x].mask];
 
             int run_len = 1;
             for (int i = x + 1; i < char_w; ++i) {
-                const uint8_t* next_px_ptr[4] = {
-                    &rgb[((y * 2) * w + i * 2) * 3], &rgb[((y * 2) * w + i * 2 + 1) * 3],
-                    &rgb[((y * 2 + 1) * w + i * 2) * 3], &rgb[((y * 2 + 1) * w + i * 2 + 1) * 3]
-                };
-                QuadrantCell next_cell;
-                get_optimal_quadrant(next_px_ptr, &next_cell);
-                if (next_cell.mask != current_cell.mask || !are_colors_similar(next_cell.fg, current_cell.fg) || !are_colors_similar(next_cell.bg, current_cell.bg)) break;
+                if (cell_row[i].mask != cell_row[x].mask ||
+                    !are_colors_similar(cell_row[i].fg, cell_row[x].fg) ||
+                    !are_colors_similar(cell_row[i].bg, cell_row[x].bg)) {
+                    break;
+                }
                 run_len++;
             }
 
-            const char* char_to_print = QUADRANT_CHARS[current_cell.mask];
-            for (int i = 0; i < run_len; ++i) buffer_append("%s", char_to_print);
+            buffer_append_run(char_to_print, run_len);
             g_cursor_col += run_len;
             x += run_len;
         }
     }
+
+    free(cell_row);
 }
 
 // =====================================================================================
@@ -664,6 +715,11 @@ static inline double get_master_clock(PlayerState *s) {
     }
 }
 
+static void free_av_packet(void* item) {
+    AVPacket* pkt = (AVPacket*)item;
+    av_packet_free(&pkt);
+}
+
 int main(int argc, char *argv[]) {
     char *video_path = NULL;
     int custom_w = 0, custom_h = 0;
@@ -959,6 +1015,9 @@ int main(int argc, char *argv[]) {
     free(frame_pool);
 
     queue_destroy(&player_state.full_q, NULL);
+    queue_destroy(&player_state.audio_q, free_av_packet); // Frees remaining AVPacket clones
+    queue_destroy(&player_state.empty_q, NULL); // Just destroys mutex/cond, items are from the pool
+    queue_destroy(&player_state.frame_pool_q, NULL);
     avformat_close_input(&player_state.format_ctx);
 
     return 0;
