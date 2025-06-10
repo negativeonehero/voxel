@@ -56,16 +56,9 @@
 typedef enum {
     MODE_FULL,
     MODE_HALF,
-    MODE_QUADRANT
+    MODE_QUADRANT,
+    MODE_QUARTER
 } RenderMode;
-
-// For 2x2 quadrant mode. Index is bitmask: 8=BR, 4=BL, 2=TR, 1=TL
-static const char* QUADRANT_CHARS[] = {
-    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
-    "▗", "▚", "▐", "▟", "▄", "▙", "▜", "█"
-};
-// Helper for popcount on a 4-bit number
-static const int BITS_SET[] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 
 static volatile sig_atomic_t g_interrupted = 0;
 
@@ -142,17 +135,24 @@ void buffer_append_run(TerminalContext *term, const char* s, int count) {
 // == Terminal Rendering Logic
 // =====================================================================================
 
-static inline float color_dist_sq(const uint8_t c1[3], const uint8_t c2[3]) {
-    long dr = c1[0] - c2[0], dg = c1[1] - c2[1], db = c1[2] - c2[2];
-    float rm = (c1[0] + c2[0]) / 512.0f;
-    return ((2.0f + rm) * dr * dr + 4.0f * dg * dg + (3.0f - rm) * db * db);
-}
-
-static inline bool are_colors_similar(const uint8_t c1[3], const uint8_t c2[3], int render_tolerance_sq) {
-    if (render_tolerance_sq == 0) {
+static inline bool are_colors_similar(const uint8_t c1[3], const uint8_t c2[3], int render_tolerance) {
+    // A tolerance of 0 means we require an exact match.
+    if (render_tolerance == 0) {
         return memcmp(c1, c2, 3) == 0;
     }
-    return color_dist_sq(c1, c2) < render_tolerance_sq;
+
+    // This is the "Chebyshev distance" on the RGB cube. It's extremely fast.
+    // It checks if the absolute difference of each color channel is within the tolerance.
+    int max_diff = abs(c1[0] - c2[0]);
+    if (max_diff >= render_tolerance) return false;
+
+    max_diff = abs(c1[1] - c2[1]);
+    if (max_diff >= render_tolerance) return false;
+
+    max_diff = abs(c1[2] - c2[2]);
+    if (max_diff >= render_tolerance) return false;
+
+    return true;
 }
 
 static inline int count_digits(int n) {
@@ -191,9 +191,9 @@ static void move_cursor(TerminalContext *term, int target_row, int target_col) {
     term->cursor_col = target_col;
 }
 
-void set_colors(TerminalContext *term, const uint8_t* new_fg, const uint8_t* new_bg, int render_tolerance_sq) {
-    bool fg_changed = !term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, new_fg, render_tolerance_sq);
-    bool bg_changed = !term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, new_bg, render_tolerance_sq);
+void set_colors(TerminalContext *term, const uint8_t* new_fg, const uint8_t* new_bg, int render_tolerance) {
+    bool fg_changed = !term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, new_fg, render_tolerance);
+    bool bg_changed = !term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, new_bg, render_tolerance);
 
     if (fg_changed && bg_changed) {
         buffer_append(term, "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm", new_fg[0], new_fg[1], new_fg[2], new_bg[0], new_bg[1], new_bg[2]);
@@ -211,17 +211,17 @@ void set_colors(TerminalContext *term, const uint8_t* new_fg, const uint8_t* new
     }
 }
 
-void render_frame_full_block(TerminalContext *term, int w, int h, const uint8_t* current_rgb, const uint8_t* prev_rgb, long frame, int render_tolerance_sq) {
+void render_frame_full_block(TerminalContext *term, int w, int h, const uint8_t* current_rgb, const uint8_t* prev_rgb, long frame, int render_tolerance) {
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ) {
             const uint8_t* cur_p = &current_rgb[(y * w + x) * 3];
-            if (frame > 0 && are_colors_similar(cur_p, &prev_rgb[(y * w + x) * 3], render_tolerance_sq)) {
+            if (frame > 0 && are_colors_similar(cur_p, &prev_rgb[(y * w + x) * 3], render_tolerance)) {
                 x++;
                 continue;
             }
 
             move_cursor(term, y + 1, x + 1);
-            if (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, cur_p, render_tolerance_sq)) {
+            if (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, cur_p, render_tolerance)) {
                 buffer_append(term, "\x1b[48;2;%d;%d;%dm", cur_p[0], cur_p[1], cur_p[2]);
                 memcpy(term->current_state.bg, cur_p, 3);
                 term->current_state.bg_is_set = true;
@@ -230,7 +230,7 @@ void render_frame_full_block(TerminalContext *term, int w, int h, const uint8_t*
 
             int run_len = 1;
             for (int i = x + 1; i < w; ++i) {
-                if (!are_colors_similar(cur_p, &current_rgb[(y * w + i) * 3], render_tolerance_sq)) break;
+                if (!are_colors_similar(cur_p, &current_rgb[(y * w + i) * 3], render_tolerance)) break;
                 run_len++;
             }
             buffer_append_run(term, " ", run_len);
@@ -240,20 +240,20 @@ void render_frame_full_block(TerminalContext *term, int w, int h, const uint8_t*
     }
 }
 
-void render_frame_half_block(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance_sq) {
+void render_frame_half_block(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance) {
     int char_h = h / 2;
     for (int y = 0; y < char_h; ++y) {
         for (int x = 0; x < w; ) {
             const uint8_t* top_p = &rgb[((y * 2) * w + x) * 3];
             const uint8_t* bot_p = &rgb[((y * 2 + 1) * w + x) * 3];
-            if (frame > 0 && are_colors_similar(top_p, &prev_rgb[((y * 2) * w + x) * 3], render_tolerance_sq) && are_colors_similar(bot_p, &prev_rgb[((y * 2 + 1) * w + x) * 3], render_tolerance_sq)) {
+            if (frame > 0 && are_colors_similar(top_p, &prev_rgb[((y * 2) * w + x) * 3], render_tolerance) && are_colors_similar(bot_p, &prev_rgb[((y * 2 + 1) * w + x) * 3], render_tolerance)) {
                 x++;
                 continue;
             }
 
             move_cursor(term, y + 1, x + 1);
-            int cost_normal = (!term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, top_p, render_tolerance_sq)) + (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, bot_p, render_tolerance_sq));
-            int cost_flipped = (!term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, bot_p, render_tolerance_sq)) + (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, top_p, render_tolerance_sq));
+            int cost_normal = (!term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, top_p, render_tolerance)) + (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, bot_p, render_tolerance));
+            int cost_flipped = (!term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, bot_p, render_tolerance)) + (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, top_p, render_tolerance));
 
             const char* char_to_print;
             const uint8_t *new_fg, *new_bg;
@@ -266,11 +266,11 @@ void render_frame_half_block(TerminalContext *term, int w, int h, const uint8_t*
                 new_fg = bot_p;
                 new_bg = top_p;
             }
-            set_colors(term, new_fg, new_bg, render_tolerance_sq);
+            set_colors(term, new_fg, new_bg, render_tolerance);
 
             int run_len = 1;
             for (int i = x + 1; i < w; ++i) {
-                if (!are_colors_similar(top_p, &rgb[((y * 2) * w + i) * 3], render_tolerance_sq) || !are_colors_similar(bot_p, &rgb[((y * 2 + 1) * w + i) * 3], render_tolerance_sq)) break;
+                if (!are_colors_similar(top_p, &rgb[((y * 2) * w + i) * 3], render_tolerance) || !are_colors_similar(bot_p, &rgb[((y * 2 + 1) * w + i) * 3], render_tolerance)) break;
                 run_len++;
             }
             buffer_append_run(term, char_to_print, run_len);
@@ -280,48 +280,91 @@ void render_frame_half_block(TerminalContext *term, int w, int h, const uint8_t*
     }
 }
 
+static const char* QUADRANT_CHARS[] = {
+    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
+    "▗", "▚", "▐", "▟", "▄", "▙", "▜", "█"
+};
+
+static const int BITS_SET[] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+
 typedef struct {
     uint8_t fg[3], bg[3];
     int mask;
 } QuadrantCell;
 
 void get_optimal_quadrant(const uint8_t* px[4], QuadrantCell* cell) {
-    float best_error = (float)LONG_MAX;
-    for (int i = 1; i < (1 << 3); ++i) {
-        long c1_sum[3] = {0}, c2_sum[3] = {0};
-        int c1_count = 0, c2_count = 0;
-        int current_mask = 0;
-        for (int j = 0; j < 4; ++j) {
-            if ((i >> j) & 1) {
-                c1_sum[0] += px[j][0]; c1_sum[1] += px[j][1]; c1_sum[2] += px[j][2];
-                c1_count++;
+    int best_mask = 0;
+    int min_error = INT_MAX;
+
+    for (int mask = 1; mask < 8; ++mask) {
+        uint8_t min_fg[3] = {255, 255, 255}, max_fg[3] = {0, 0, 0};
+        uint8_t min_bg[3] = {255, 255, 255}, max_bg[3] = {0, 0, 0};
+
+        for (int i = 0; i < 4; ++i) {
+            if ((mask >> i) & 1) {
+                for (int k = 0; k < 3; ++k) {
+                    if (px[i][k] < min_fg[k]) min_fg[k] = px[i][k];
+                    if (px[i][k] > max_fg[k]) max_fg[k] = px[i][k];
+                }
             } else {
-                c2_sum[0] += px[j][0]; c2_sum[1] += px[j][1]; c2_sum[2] += px[j][2];
-                c2_count++;
+                for (int k = 0; k < 3; ++k) {
+                    if (px[i][k] < min_bg[k]) min_bg[k] = px[i][k];
+                    if (px[i][k] > max_bg[k]) max_bg[k] = px[i][k];
+                }
             }
         }
-        if (c2_count == 0) continue;
 
-        uint8_t c1_avg[3] = {c1_sum[0] / c1_count, c1_sum[1] / c1_count, c1_sum[2] / c1_count};
-        uint8_t c2_avg[3] = {c2_sum[0] / c2_count, c2_sum[1] / c2_count, c2_sum[2] / c2_count};
+        int current_error = (max_fg[0] - min_fg[0]) + (max_fg[1] - min_fg[1]) + (max_fg[2] - min_fg[2]) +
+                            (max_bg[0] - min_bg[0]) + (max_bg[1] - min_bg[1]) + (max_bg[2] - min_bg[2]);
 
-        float current_error = 0;
-        for (int j = 0; j < 4; ++j) {
-            if ((i >> j) & 1) {
-                current_error += color_dist_sq(px[j], c1_avg);
-                current_mask |= (1 << j);
-            } else {
-                current_error += color_dist_sq(px[j], c2_avg);
-            }
-        }
-        if (current_error < best_error) {
-            best_error = current_error;
-            cell->mask = current_mask;
-            memcpy(cell->fg, c1_avg, 3);
-            memcpy(cell->bg, c2_avg, 3);
+        if (current_error < min_error) {
+            min_error = current_error;
+            best_mask = mask;
         }
     }
-    // Invert mask if it has more than 2 bits set, saving a color change
+
+    uint8_t min_solid[3] = {255, 255, 255}, max_solid[3] = {0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            if (px[i][k] < min_solid[k]) min_solid[k] = px[i][k];
+            if (px[i][k] > max_solid[k]) max_solid[k] = px[i][k];
+        }
+    }
+    int solid_error = (max_solid[0] - min_solid[0]) + (max_solid[1] - min_solid[1]) + (max_solid[2] - min_solid[2]);
+    if (solid_error < min_error) {
+        best_mask = 0;
+    }
+
+    long sum_fg[3] = {0}, sum_bg[3] = {0};
+    int fg_count = 0, bg_count = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        if ((best_mask >> i) & 1) {
+            sum_fg[0] += px[i][0]; sum_fg[1] += px[i][1]; sum_fg[2] += px[i][2];
+            fg_count++;
+        } else {
+            sum_bg[0] += px[i][0]; sum_bg[1] += px[i][1]; sum_bg[2] += px[i][2];
+            bg_count++;
+        }
+    }
+
+    cell->mask = best_mask;
+    
+    if (bg_count > 0) {
+        cell->bg[0] = sum_bg[0] / bg_count;
+        cell->bg[1] = sum_bg[1] / bg_count;
+        cell->bg[2] = sum_bg[2] / bg_count;
+    } else {
+        memcpy(cell->bg, cell->fg, 3);
+    }
+    if (fg_count > 0) {
+        cell->fg[0] = sum_fg[0] / fg_count;
+        cell->fg[1] = sum_fg[1] / fg_count;
+        cell->fg[2] = sum_fg[2] / fg_count;
+    } else {
+        memcpy(cell->fg, cell->bg, 3);
+    }
+
     if (BITS_SET[cell->mask] > 2) {
         cell->mask = 0xF & ~cell->mask;
         uint8_t temp[3];
@@ -331,7 +374,7 @@ void get_optimal_quadrant(const uint8_t* px[4], QuadrantCell* cell) {
     }
 }
 
-void render_frame_quadrant(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance_sq) {
+void render_frame_quadrant(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance) {
     int char_w = w / 2, char_h = h / 2;
 
     QuadrantCell *cell_row = malloc(char_w * sizeof(QuadrantCell));
@@ -347,10 +390,10 @@ void render_frame_quadrant(TerminalContext *term, int w, int h, const uint8_t* r
                 &rgb[((y * 2 + 1) * w + x * 2 + 1) * 3]
             };
             if (frame > 0 &&
-                are_colors_similar(px_ptr[0], &prev_rgb[((y * 2) * w + x * 2) * 3], render_tolerance_sq) &&
-                are_colors_similar(px_ptr[1], &prev_rgb[((y * 2) * w + x * 2 + 1) * 3], render_tolerance_sq) &&
-                are_colors_similar(px_ptr[2], &prev_rgb[((y * 2 + 1) * w + x * 2) * 3], render_tolerance_sq) &&
-                are_colors_similar(px_ptr[3], &prev_rgb[((y * 2 + 1) * w + x * 2 + 1) * 3], render_tolerance_sq))
+                are_colors_similar(px_ptr[0], &prev_rgb[((y * 2) * w + x * 2) * 3], render_tolerance) &&
+                are_colors_similar(px_ptr[1], &prev_rgb[((y * 2) * w + x * 2 + 1) * 3], render_tolerance) &&
+                are_colors_similar(px_ptr[2], &prev_rgb[((y * 2 + 1) * w + x * 2) * 3], render_tolerance) &&
+                are_colors_similar(px_ptr[3], &prev_rgb[((y * 2 + 1) * w + x * 2 + 1) * 3], render_tolerance))
             {
                 cell_row[x].mask = -1;
                 continue;
@@ -372,14 +415,14 @@ void render_frame_quadrant(TerminalContext *term, int w, int h, const uint8_t* r
 
             move_cursor(term, y + 1, x + 1);
 
-            set_colors(term, cell_row[x].fg, cell_row[x].bg, render_tolerance_sq);
+            set_colors(term, cell_row[x].fg, cell_row[x].bg, render_tolerance);
             const char* char_to_print = QUADRANT_CHARS[cell_row[x].mask];
 
             int run_len = 1;
             for (int i = x + 1; i < char_w; ++i) {
                 if (cell_row[i].mask != cell_row[x].mask ||
-                    !are_colors_similar(cell_row[i].fg, cell_row[x].fg, render_tolerance_sq) ||
-                    !are_colors_similar(cell_row[i].bg, cell_row[x].bg, render_tolerance_sq)) {
+                    !are_colors_similar(cell_row[i].fg, cell_row[x].fg, render_tolerance) ||
+                    !are_colors_similar(cell_row[i].bg, cell_row[x].bg, render_tolerance)) {
                     break;
                 }
                 run_len++;
@@ -391,6 +434,185 @@ void render_frame_quadrant(TerminalContext *term, int w, int h, const uint8_t* r
         }
     }
 
+    free(cell_row);
+}
+
+static const char SHAPES_QUARTER[11][4] = {
+    "\u2584", "\u2590", "\u2598", "\u259d", "\u2596",
+    "\u2597", "\u259e", "\u2582", "\u2586", "\u258e",
+    "\u258a"
+};
+
+static const uint8_t PIXEL_MAP_QUARTER[11][16] = {
+    {0,0,0,0, 0,0,0,0, 1,1,1,1, 1,1,1,1}, // bottom half
+    {0,0,1,1, 0,0,1,1, 0,0,1,1, 0,0,1,1}, // right half
+    {1,1,0,0, 1,1,0,0, 0,0,0,0, 0,0,0,0}, // top left quarter
+    {0,0,1,1, 0,0,1,1, 0,0,0,0, 0,0,0,0}, // top right quarter
+    {0,0,0,0, 0,0,0,0, 1,1,0,0, 1,1,0,0}, // bottom left quarter
+    {0,0,0,0, 0,0,0,0, 0,0,1,1, 0,0,1,1}, // bottom right quarter
+    {0,0,1,1, 0,0,1,1, 1,1,0,0, 1,1,0,0}, // diagonal (TR+BL)
+    {0,0,0,0, 0,0,0,0, 0,0,0,0, 1,1,1,1}, // lower quarter
+    {0,0,0,0, 1,1,1,1, 1,1,1,1, 1,1,1,1}, // lower 3/4
+    {1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0}, // left 1/4 vertical
+    {1,1,1,0, 1,1,1,0, 1,1,1,0, 1,1,1,0}  // left 3/4 vertical
+};
+typedef struct {
+    uint8_t fg[3], bg[3];
+    const char* chr;
+} QuarterCell;
+
+static void get_optimal_4x4_cell(const uint8_t* px[16], QuarterCell* cell) {
+    int best_shape_idx = 0;
+    int min_error = INT_MAX;
+
+    for (int shape_idx = 0; shape_idx < 11; ++shape_idx) {
+        uint8_t min_fg[3] = {255, 255, 255}, max_fg[3] = {0, 0, 0};
+        uint8_t min_bg[3] = {255, 255, 255}, max_bg[3] = {0, 0, 0};
+        int fg_count = 0, bg_count = 0;
+
+        for (int i = 0; i < 16; ++i) {
+            if (PIXEL_MAP_QUARTER[shape_idx][i]) {
+                for(int k=0; k<3; ++k) {
+                    if (px[i][k] < min_fg[k]) min_fg[k] = px[i][k];
+                    if (px[i][k] > max_fg[k]) max_fg[k] = px[i][k];
+                }
+                fg_count++;
+            } else {
+                for(int k=0; k<3; ++k) {
+                    if (px[i][k] < min_bg[k]) min_bg[k] = px[i][k];
+                    if (px[i][k] > max_bg[k]) max_bg[k] = px[i][k];
+                }
+                bg_count++;
+            }
+        }
+
+        int error_fg = 0;
+        if (fg_count > 0) {
+            error_fg = max_fg[0] - min_fg[0];
+            if (max_fg[1] - min_fg[1] > error_fg) error_fg = max_fg[1] - min_fg[1];
+            if (max_fg[2] - min_fg[2] > error_fg) error_fg = max_fg[2] - min_fg[2];
+        }
+
+        int error_bg = 0;
+        if (bg_count > 0) {
+            error_bg = max_bg[0] - min_bg[0];
+            if (max_bg[1] - min_bg[1] > error_bg) error_bg = max_bg[1] - min_bg[1];
+            if (max_bg[2] - min_bg[2] > error_bg) error_bg = max_bg[2] - min_bg[2];
+        }
+
+        int current_error = error_fg + error_bg;
+
+        if (current_error < min_error) {
+            min_error = current_error;
+            best_shape_idx = shape_idx;
+        }
+    }
+
+    long sum_fg[3] = {0,0,0}, sum_bg[3] = {0,0,0};
+    int fg_count = 0, bg_count = 0;
+
+    for (int i = 0; i < 16; ++i) {
+        if (PIXEL_MAP_QUARTER[best_shape_idx][i]) {
+            sum_fg[0] += px[i][0]; sum_fg[1] += px[i][1]; sum_fg[2] += px[i][2];
+            fg_count++;
+        } else {
+            sum_bg[0] += px[i][0]; sum_bg[1] += px[i][1]; sum_bg[2] += px[i][2];
+            bg_count++;
+        }
+    }
+
+    cell->chr = SHAPES_QUARTER[best_shape_idx];
+    if (fg_count > 0) {
+        cell->fg[0] = sum_fg[0] / fg_count;
+        cell->fg[1] = sum_fg[1] / fg_count;
+        cell->fg[2] = sum_fg[2] / fg_count;
+    } else {
+        if (bg_count > 0) {
+            cell->fg[0] = sum_bg[0] / bg_count;
+            cell->fg[1] = sum_bg[1] / bg_count;
+            cell->fg[2] = sum_bg[2] / bg_count;
+        }
+    }
+    if (bg_count > 0) {
+        cell->bg[0] = sum_bg[0] / bg_count;
+        cell->bg[1] = sum_bg[1] / bg_count;
+        cell->bg[2] = sum_bg[2] / bg_count;
+    } else {
+        if (fg_count > 0) {
+            cell->bg[0] = sum_fg[0] / fg_count;
+            cell->bg[1] = sum_fg[1] / fg_count;
+            cell->bg[2] = sum_fg[2] / fg_count;
+        }
+    }
+}
+
+void render_frame_quarter(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance) {
+    int char_w = w / 4, char_h = h / 4;
+
+    QuarterCell* cell_row = malloc(char_w * sizeof(QuarterCell));
+    if (!cell_row) return;
+
+    for (int y = 0; y < char_h; ++y) {
+        bool row_has_changes = false;
+        for (int x = 0; x < char_w; ++x) {
+            bool block_changed = false;
+            if (frame > 0) {
+                for (int i = 0; i < 4 && !block_changed; ++i) {
+                    for (int j = 0; j < 4; ++j) {
+                        const uint8_t* cur_p = &rgb[((y * 4 + i) * w + (x * 4 + j)) * 3];
+                        const uint8_t* prev_p = &prev_rgb[((y * 4 + i) * w + (x * 4 + j)) * 3];
+
+                        if (!are_colors_similar(cur_p, prev_p, render_tolerance)) {
+                            block_changed = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                block_changed = true;
+            }
+
+            if (!block_changed) {
+                cell_row[x].chr = NULL;
+                continue;
+            }
+
+            row_has_changes = true;
+            const uint8_t* px_ptr[16];
+            for (int i = 0; i < 4; ++i) {
+                for (int j = 0; j < 4; ++j) {
+                    px_ptr[i * 4 + j] = &rgb[((y * 4 + i) * w + (x * 4 + j)) * 3];
+                }
+            }
+            get_optimal_4x4_cell(px_ptr, &cell_row[x]);
+        }
+
+        if (!row_has_changes) continue;
+
+        for (int x = 0; x < char_w; ) {
+            if (cell_row[x].chr == NULL) {
+                x++;
+                continue;
+            }
+            move_cursor(term, y + 1, x + 1);
+            set_colors(term, cell_row[x].fg, cell_row[x].bg, render_tolerance);
+
+            const char* char_to_print = cell_row[x].chr;
+            int run_len = 1;
+            for (int i = x + 1; i < char_w; ++i) {
+                if (cell_row[i].chr != char_to_print ||
+                    !are_colors_similar(cell_row[i].fg, cell_row[x].fg, render_tolerance) ||
+                    !are_colors_similar(cell_row[i].bg, cell_row[x].bg, render_tolerance)) {
+                    break;
+                }
+                run_len++;
+            }
+
+            buffer_append_run(term, char_to_print, run_len);
+            term->cursor_col += run_len;
+            x += run_len;
+        }
+    }
     free(cell_row);
 }
 
@@ -700,6 +922,7 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -m MODE          Enable high-resolution mode. MODE can be:\n");
     fprintf(stderr, "                     half:     use half blocks for 2x vertical resolution\n");
     fprintf(stderr, "                     quadrant: use quadrant blocks for 2x vertical/horizontal resolution\n");
+    fprintf(stderr, "                     quarter:  use quarter blocks to further enhance video quality\n");
     fprintf(stderr, "  -t TOLERANCE     Perceptual color tolerance\n");
     fprintf(stderr, "                     Higher number means lower color quality and lower bandwidth.\n");
     fprintf(stderr, "  -a               Adaptive quality mode, overrides -t\n");
@@ -733,7 +956,7 @@ int main(int argc, char *argv[]) {
     bool unlimited_mode = false;
     bool show_stats = false;
     RenderMode render_mode = MODE_FULL;
-    int render_tolerance_sq = 0;
+    int render_tolerance = 0;
     bool adaptive_quality_mode = false;
 
     // --- Argument Parsing ---
@@ -751,13 +974,15 @@ int main(int argc, char *argv[]) {
                     render_mode = MODE_HALF;
                 } else if (strcmp(optarg, "quadrant") == 0) {
                     render_mode = MODE_QUADRANT;
+                } else if (strcmp(optarg, "quarter") == 0) {
+                    render_mode = MODE_QUARTER;
                 } else {
-                    fprintf(stderr, "ERROR: Unknown high-res mode '%s'. Use 'half' or 'quadrant'.\n", optarg);
+                    fprintf(stderr, "ERROR: Unknown high-res mode '%s', available options: 'half', 'quadrant', 'quarter'\n", optarg);
                     return 1;
                 }
                 break;
             case 't':
-                render_tolerance_sq = atoi(optarg);
+                render_tolerance = atoi(optarg);
                 break;
             case 'u':
                 unlimited_mode = true;
@@ -769,7 +994,7 @@ int main(int argc, char *argv[]) {
                 adaptive_quality_mode = true;
                 break;
             case 'v':
-                fprintf(stderr, "voxel version 1.0.1\n");
+                fprintf(stderr, "voxel version 1.1.0\n");
                 return 1;
             case 'h':
             default:
@@ -828,11 +1053,12 @@ int main(int argc, char *argv[]) {
             case MODE_FULL: render_w = char_w; render_h = char_h; break;
             case MODE_HALF: render_w = char_w; render_h = char_h * 2; break;
             case MODE_QUADRANT: render_w = char_w * 2; render_h = char_h * 2; break;
+            case MODE_QUARTER: render_w = char_w * 4; render_h = char_h * 4; break;
         }
     }
     if (render_mode == MODE_HALF && render_h % 2 != 0) render_h--;
     if (render_mode == MODE_QUADRANT) { if (render_w % 2 != 0) render_w--; if (render_h % 2 != 0) render_h--; }
-    if (render_w < 1) render_w = 1; if (render_h < 1) render_h = 1;
+    if (render_mode == MODE_QUARTER) { if (render_w % 4 != 0) render_w -= (render_w % 4); if (render_h % 4 != 0) render_h -= (render_h % 4); }
     player_state.render_w = render_w;
     player_state.render_h = render_h;
 
@@ -910,9 +1136,10 @@ int main(int argc, char *argv[]) {
 
         term.cursor_row = 0; term.cursor_col = 0;
         switch (render_mode) {
-            case MODE_FULL: render_frame_full_block(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance_sq); break;
-            case MODE_HALF: render_frame_half_block(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance_sq); break;
-            case MODE_QUADRANT: render_frame_quadrant(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance_sq); break;
+            case MODE_FULL: render_frame_full_block(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance); break;
+            case MODE_HALF: render_frame_half_block(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance); break;
+            case MODE_QUADRANT: render_frame_quadrant(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance); break;
+            case MODE_QUARTER: render_frame_quarter(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance); break;
         }
         memcpy(prev_rgb_buffer, q_frame->rgb_data, rgb_buffer_size);
         buffer_flush(&term);
@@ -924,10 +1151,10 @@ int main(int argc, char *argv[]) {
 
             if (adaptive_quality_mode && !unlimited_mode && video_frame_duration > 0) {
                 if (render_duration > video_frame_duration * 1.10) {
-                    render_tolerance_sq += 10;
+                    render_tolerance += 10;
                 } else if (render_duration < video_frame_duration * 0.90) {
-                    render_tolerance_sq -= 10;
-                    if (render_tolerance_sq < 0) render_tolerance_sq = 0;
+                    render_tolerance -= 10;
+                    if (render_tolerance < 0) render_tolerance = 0;
                 }
             }
 
@@ -971,16 +1198,18 @@ int main(int argc, char *argv[]) {
         const char* mode_str = "Full-Block (1x1)";
         if (render_mode == MODE_HALF) mode_str = "Half-Block (1x2)";
         else if (render_mode == MODE_QUADRANT) mode_str = "Quadrant (2x2)";
+        else if (render_mode == MODE_QUARTER) mode_str = "Quarter (4x4)";
         printf("Render Mode:          %s\n", mode_str);
 
         int term_w = render_w, term_h = render_h;
         if (render_mode == MODE_HALF) term_h /= 2;
         else if (render_mode == MODE_QUADRANT) { term_w /= 2; term_h /= 2; }
+        else if (render_mode == MODE_QUARTER) { term_w /= 4; term_h /= 4; }
         printf("Pixel/Char Size:      %dpx W x %dpx H -> %dch W x %dch H\n", render_w, render_h, term_w, term_h);
         if (adaptive_quality_mode)
             printf("Render Tolerance:     Adaptive\n");
         else
-            printf("Render Tolerance:     %d\n", render_tolerance_sq);
+            printf("Render Tolerance:     %d\n", render_tolerance);
         printf("Playback Speed:       %s\n", unlimited_mode ? "Unlimited" : "Normal");
 
         if (frame_count > 0 && total_duration > 0) {
