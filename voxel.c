@@ -65,10 +65,6 @@ static const char* QUADRANT_CHARS[] = {
 // Helper for popcount on a 4-bit number
 static const int BITS_SET[] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 
-// Global config set by command-line arguments
-static RenderMode g_render_mode = MODE_FULL;
-static int g_render_tolerance_sq = 0;
-
 static volatile sig_atomic_t g_interrupted = 0;
 
 // =====================================================================================
@@ -82,34 +78,36 @@ typedef struct {
     bool bg_is_set;
 } TerminalState;
 
-static char g_output_buffer[OUTPUT_BUFFER_SIZE];
-static size_t g_buffer_pos = 0;
-static long g_terminal_bytes_written = 0;
-static int g_cursor_row = 0, g_cursor_col = 0;
-static TerminalState g_term_state;
+typedef struct {
+    char buffer[OUTPUT_BUFFER_SIZE];
+    size_t buffer_pos;
+    long bytes_written;
+    int cursor_row, cursor_col;
+    TerminalState current_state;
+} TerminalContext;
 
-void buffer_flush() {
-    if (g_buffer_pos > 0) {
-        fwrite(g_output_buffer, 1, g_buffer_pos, stdout);
-        g_terminal_bytes_written += g_buffer_pos;
-        g_buffer_pos = 0;
+void buffer_flush(TerminalContext *term) {
+    if (term->buffer_pos > 0) {
+        fwrite(term->buffer, 1, term->buffer_pos, stdout);
+        term->bytes_written += term->buffer_pos;
+        term->buffer_pos = 0;
     }
 }
 
-void buffer_append(const char *format, ...) {
-    if (g_buffer_pos >= OUTPUT_BUFFER_SIZE - 256) {
-        buffer_flush();
+void buffer_append(TerminalContext *term, const char *format, ...) {
+    if (term->buffer_pos >= OUTPUT_BUFFER_SIZE - 256) {
+        buffer_flush(term);
     }
     va_list args;
     va_start(args, format);
-    int bytes = vsnprintf(g_output_buffer + g_buffer_pos, OUTPUT_BUFFER_SIZE - g_buffer_pos, format, args);
+    int bytes = vsnprintf(term->buffer + term->buffer_pos, OUTPUT_BUFFER_SIZE - term->buffer_pos, format, args);
     va_end(args);
     if (bytes > 0) {
-        g_buffer_pos += bytes;
+        term->buffer_pos += bytes;
     }
 }
 
-void buffer_append_run(const char* s, int count) {
+void buffer_append_run(TerminalContext *term, const char* s, int count) {
     if (count <= 0) return;
 
     size_t len = strlen(s);
@@ -117,16 +115,16 @@ void buffer_append_run(const char* s, int count) {
 
     if (len * count >= OUTPUT_BUFFER_SIZE) {
         for (int i = 0; i < count; ++i) {
-            buffer_append("%s", s);
+            buffer_append(term, "%s", s);
         }
         return;
     }
 
-    if (g_buffer_pos + (len * count) >= OUTPUT_BUFFER_SIZE) {
-        buffer_flush();
+    if (term->buffer_pos + (len * count) >= OUTPUT_BUFFER_SIZE) {
+        buffer_flush(term);
     }
 
-    char* dest = g_output_buffer + g_buffer_pos;
+    char* dest = term->buffer + term->buffer_pos;
     if (len == 1) {
         memset(dest, s[0], count);
     } else {
@@ -135,7 +133,7 @@ void buffer_append_run(const char* s, int count) {
             dest += len;
         }
     }
-    g_buffer_pos += len * count;
+    term->buffer_pos += len * count;
 }
 
 // =====================================================================================
@@ -144,15 +142,15 @@ void buffer_append_run(const char* s, int count) {
 
 static inline float color_dist_sq(const uint8_t c1[3], const uint8_t c2[3]) {
     long dr = c1[0] - c2[0], dg = c1[1] - c2[1], db = c1[2] - c2[2];
-    float rm = (c1[0] + c2[0]) / 512.0f; // CIEDE2000 approximation
+    float rm = (c1[0] + c2[0]) / 512.0f;
     return ((2.0f + rm) * dr * dr + 4.0f * dg * dg + (3.0f - rm) * db * db);
 }
 
-static inline bool are_colors_similar(const uint8_t c1[3], const uint8_t c2[3]) {
-    if (g_render_tolerance_sq == 0) {
+static inline bool are_colors_similar(const uint8_t c1[3], const uint8_t c2[3], int render_tolerance_sq) {
+    if (render_tolerance_sq == 0) {
         return memcmp(c1, c2, 3) == 0;
     }
-    return color_dist_sq(c1, c2) < g_render_tolerance_sq;
+    return color_dist_sq(c1, c2) < render_tolerance_sq;
 }
 
 static inline int count_digits(int n) {
@@ -164,96 +162,96 @@ static inline int count_digits(int n) {
     return 5;
 }
 
-static void move_cursor(int target_row, int target_col) {
-    if (g_cursor_row == target_row && g_cursor_col == target_col) return;
+static void move_cursor(TerminalContext *term, int target_row, int target_col) {
+    if (term->cursor_row == target_row && term->cursor_col == target_col) return;
 
-    if (g_cursor_col != 0 && target_col == 1 && target_row == g_cursor_row + 1) {
-        buffer_append("\n");
-        g_cursor_row = target_row;
-        g_cursor_col = target_col;
+    if (term->cursor_col != 0 && target_col == 1 && target_row == term->cursor_row + 1) {
+        buffer_append(term, "\n");
+        term->cursor_row = target_row;
+        term->cursor_col = target_col;
         return;
     }
 
     int abs_cost = 4 + count_digits(target_row) + count_digits(target_col);
     int rel_cost = 0;
-    int row_diff = target_row - g_cursor_row;
-    int col_diff = target_col - g_cursor_col;
+    int row_diff = target_row - term->cursor_row;
+    int col_diff = target_col - term->cursor_col;
     if (row_diff != 0) rel_cost += 3 + count_digits(row_diff);
     if (col_diff != 0) rel_cost += 3 + count_digits(col_diff);
 
-    if (g_cursor_row == 0 || abs_cost <= rel_cost) {
-        buffer_append("\x1b[%d;%dH", target_row, target_col);
+    if (term->cursor_row == 0 || abs_cost <= rel_cost) {
+        buffer_append(term, "\x1b[%d;%dH", target_row, target_col);
     } else {
-        if (row_diff > 0) buffer_append("\x1b[%dB", row_diff); else if (row_diff < 0) buffer_append("\x1b[%dA", -row_diff);
-        if (col_diff > 0) buffer_append("\x1b[%dC", col_diff); else if (col_diff < 0) buffer_append("\x1b[%dD", -col_diff);
+        if (row_diff > 0) buffer_append(term, "\x1b[%dB", row_diff); else if (row_diff < 0) buffer_append(term, "\x1b[%dA", -row_diff);
+        if (col_diff > 0) buffer_append(term, "\x1b[%dC", col_diff); else if (col_diff < 0) buffer_append(term, "\x1b[%dD", -col_diff);
     }
-    g_cursor_row = target_row;
-    g_cursor_col = target_col;
+    term->cursor_row = target_row;
+    term->cursor_col = target_col;
 }
 
-void set_colors(const uint8_t* new_fg, const uint8_t* new_bg) {
-    bool fg_changed = !g_term_state.fg_is_set || !are_colors_similar(g_term_state.fg, new_fg);
-    bool bg_changed = !g_term_state.bg_is_set || !are_colors_similar(g_term_state.bg, new_bg);
+void set_colors(TerminalContext *term, const uint8_t* new_fg, const uint8_t* new_bg, int render_tolerance_sq) {
+    bool fg_changed = !term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, new_fg, render_tolerance_sq);
+    bool bg_changed = !term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, new_bg, render_tolerance_sq);
 
     if (fg_changed && bg_changed) {
-        buffer_append("\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm", new_fg[0], new_fg[1], new_fg[2], new_bg[0], new_bg[1], new_bg[2]);
-        memcpy(g_term_state.fg, new_fg, 3);
-        memcpy(g_term_state.bg, new_bg, 3);
-        g_term_state.fg_is_set = g_term_state.bg_is_set = true;
+        buffer_append(term, "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm", new_fg[0], new_fg[1], new_fg[2], new_bg[0], new_bg[1], new_bg[2]);
+        memcpy(term->current_state.fg, new_fg, 3);
+        memcpy(term->current_state.bg, new_bg, 3);
+        term->current_state.fg_is_set = term->current_state.bg_is_set = true;
     } else if (fg_changed) {
-        buffer_append("\x1b[38;2;%d;%d;%dm", new_fg[0], new_fg[1], new_fg[2]);
-        memcpy(g_term_state.fg, new_fg, 3);
-        g_term_state.fg_is_set = true;
+        buffer_append(term, "\x1b[38;2;%d;%d;%dm", new_fg[0], new_fg[1], new_fg[2]);
+        memcpy(term->current_state.fg, new_fg, 3);
+        term->current_state.fg_is_set = true;
     } else if (bg_changed) {
-        buffer_append("\x1b[48;2;%d;%d;%dm", new_bg[0], new_bg[1], new_bg[2]);
-        memcpy(g_term_state.bg, new_bg, 3);
-        g_term_state.bg_is_set = true;
+        buffer_append(term, "\x1b[48;2;%d;%d;%dm", new_bg[0], new_bg[1], new_bg[2]);
+        memcpy(term->current_state.bg, new_bg, 3);
+        term->current_state.bg_is_set = true;
     }
 }
 
-void render_frame_full_block(int w, int h, const uint8_t* current_rgb, const uint8_t* prev_rgb, long frame) {
+void render_frame_full_block(TerminalContext *term, int w, int h, const uint8_t* current_rgb, const uint8_t* prev_rgb, long frame, int render_tolerance_sq) {
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ) {
             const uint8_t* cur_p = &current_rgb[(y * w + x) * 3];
-            if (frame > 0 && are_colors_similar(cur_p, &prev_rgb[(y * w + x) * 3])) {
+            if (frame > 0 && are_colors_similar(cur_p, &prev_rgb[(y * w + x) * 3], render_tolerance_sq)) {
                 x++;
                 continue;
             }
 
-            move_cursor(y + 1, x + 1);
-            if (!g_term_state.bg_is_set || !are_colors_similar(g_term_state.bg, cur_p)) {
-                buffer_append("\x1b[48;2;%d;%d;%dm", cur_p[0], cur_p[1], cur_p[2]);
-                memcpy(g_term_state.bg, cur_p, 3);
-                g_term_state.bg_is_set = true;
-                g_term_state.fg_is_set = false;
+            move_cursor(term, y + 1, x + 1);
+            if (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, cur_p, render_tolerance_sq)) {
+                buffer_append(term, "\x1b[48;2;%d;%d;%dm", cur_p[0], cur_p[1], cur_p[2]);
+                memcpy(term->current_state.bg, cur_p, 3);
+                term->current_state.bg_is_set = true;
+                term->current_state.fg_is_set = false;
             }
 
             int run_len = 1;
             for (int i = x + 1; i < w; ++i) {
-                if (!are_colors_similar(cur_p, &current_rgb[(y * w + i) * 3])) break;
+                if (!are_colors_similar(cur_p, &current_rgb[(y * w + i) * 3], render_tolerance_sq)) break;
                 run_len++;
             }
-            buffer_append_run(" ", run_len);
-            g_cursor_col += run_len;
+            buffer_append_run(term, " ", run_len);
+            term->cursor_col += run_len;
             x += run_len;
         }
     }
 }
 
-void render_frame_half_block(int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame) {
+void render_frame_half_block(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance_sq) {
     int char_h = h / 2;
     for (int y = 0; y < char_h; ++y) {
         for (int x = 0; x < w; ) {
             const uint8_t* top_p = &rgb[((y * 2) * w + x) * 3];
             const uint8_t* bot_p = &rgb[((y * 2 + 1) * w + x) * 3];
-            if (frame > 0 && are_colors_similar(top_p, &prev_rgb[((y * 2) * w + x) * 3]) && are_colors_similar(bot_p, &prev_rgb[((y * 2 + 1) * w + x) * 3])) {
+            if (frame > 0 && are_colors_similar(top_p, &prev_rgb[((y * 2) * w + x) * 3], render_tolerance_sq) && are_colors_similar(bot_p, &prev_rgb[((y * 2 + 1) * w + x) * 3], render_tolerance_sq)) {
                 x++;
                 continue;
             }
 
-            move_cursor(y + 1, x + 1);
-            int cost_normal = (!g_term_state.fg_is_set || !are_colors_similar(g_term_state.fg, top_p)) + (!g_term_state.bg_is_set || !are_colors_similar(g_term_state.bg, bot_p));
-            int cost_flipped = (!g_term_state.fg_is_set || !are_colors_similar(g_term_state.fg, bot_p)) + (!g_term_state.bg_is_set || !are_colors_similar(g_term_state.bg, top_p));
+            move_cursor(term, y + 1, x + 1);
+            int cost_normal = (!term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, top_p, render_tolerance_sq)) + (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, bot_p, render_tolerance_sq));
+            int cost_flipped = (!term->current_state.fg_is_set || !are_colors_similar(term->current_state.fg, bot_p, render_tolerance_sq)) + (!term->current_state.bg_is_set || !are_colors_similar(term->current_state.bg, top_p, render_tolerance_sq));
 
             const char* char_to_print;
             const uint8_t *new_fg, *new_bg;
@@ -266,15 +264,15 @@ void render_frame_half_block(int w, int h, const uint8_t* rgb, const uint8_t* pr
                 new_fg = bot_p;
                 new_bg = top_p;
             }
-            set_colors(new_fg, new_bg);
+            set_colors(term, new_fg, new_bg, render_tolerance_sq);
 
             int run_len = 1;
             for (int i = x + 1; i < w; ++i) {
-                if (!are_colors_similar(top_p, &rgb[((y * 2) * w + i) * 3]) || !are_colors_similar(bot_p, &rgb[((y * 2 + 1) * w + i) * 3])) break;
+                if (!are_colors_similar(top_p, &rgb[((y * 2) * w + i) * 3], render_tolerance_sq) || !are_colors_similar(bot_p, &rgb[((y * 2 + 1) * w + i) * 3], render_tolerance_sq)) break;
                 run_len++;
             }
-            buffer_append_run(char_to_print, run_len);
-            g_cursor_col += run_len;
+            buffer_append_run(term, char_to_print, run_len);
+            term->cursor_col += run_len;
             x += run_len;
         }
     }
@@ -331,7 +329,7 @@ void get_optimal_quadrant(const uint8_t* px[4], QuadrantCell* cell) {
     }
 }
 
-void render_frame_quadrant(int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame) {
+void render_frame_quadrant(TerminalContext *term, int w, int h, const uint8_t* rgb, const uint8_t* prev_rgb, long frame, int render_tolerance_sq) {
     int char_w = w / 2, char_h = h / 2;
 
     QuadrantCell *cell_row = malloc(char_w * sizeof(QuadrantCell));
@@ -347,10 +345,10 @@ void render_frame_quadrant(int w, int h, const uint8_t* rgb, const uint8_t* prev
                 &rgb[((y * 2 + 1) * w + x * 2 + 1) * 3]
             };
             if (frame > 0 &&
-                are_colors_similar(px_ptr[0], &prev_rgb[((y * 2) * w + x * 2) * 3]) &&
-                are_colors_similar(px_ptr[1], &prev_rgb[((y * 2) * w + x * 2 + 1) * 3]) &&
-                are_colors_similar(px_ptr[2], &prev_rgb[((y * 2 + 1) * w + x * 2) * 3]) &&
-                are_colors_similar(px_ptr[3], &prev_rgb[((y * 2 + 1) * w + x * 2 + 1) * 3]))
+                are_colors_similar(px_ptr[0], &prev_rgb[((y * 2) * w + x * 2) * 3], render_tolerance_sq) &&
+                are_colors_similar(px_ptr[1], &prev_rgb[((y * 2) * w + x * 2 + 1) * 3], render_tolerance_sq) &&
+                are_colors_similar(px_ptr[2], &prev_rgb[((y * 2 + 1) * w + x * 2) * 3], render_tolerance_sq) &&
+                are_colors_similar(px_ptr[3], &prev_rgb[((y * 2 + 1) * w + x * 2 + 1) * 3], render_tolerance_sq))
             {
                 cell_row[x].mask = -1;
                 continue;
@@ -370,23 +368,23 @@ void render_frame_quadrant(int w, int h, const uint8_t* rgb, const uint8_t* prev
                 continue;
             }
 
-            move_cursor(y + 1, x + 1);
+            move_cursor(term, y + 1, x + 1);
 
-            set_colors(cell_row[x].fg, cell_row[x].bg);
+            set_colors(term, cell_row[x].fg, cell_row[x].bg, render_tolerance_sq);
             const char* char_to_print = QUADRANT_CHARS[cell_row[x].mask];
 
             int run_len = 1;
             for (int i = x + 1; i < char_w; ++i) {
                 if (cell_row[i].mask != cell_row[x].mask ||
-                    !are_colors_similar(cell_row[i].fg, cell_row[x].fg) ||
-                    !are_colors_similar(cell_row[i].bg, cell_row[x].bg)) {
+                    !are_colors_similar(cell_row[i].fg, cell_row[x].fg, render_tolerance_sq) ||
+                    !are_colors_similar(cell_row[i].bg, cell_row[x].bg, render_tolerance_sq)) {
                     break;
                 }
                 run_len++;
             }
 
-            buffer_append_run(char_to_print, run_len);
-            g_cursor_col += run_len;
+            buffer_append_run(term, char_to_print, run_len);
+            term->cursor_col += run_len;
             x += run_len;
         }
     }
@@ -725,6 +723,8 @@ int main(int argc, char *argv[]) {
     int custom_w = 0, custom_h = 0;
     bool unlimited_mode = false;
     bool show_stats = false;
+    RenderMode render_mode = MODE_FULL;
+    int render_tolerance_sq = 0;
     bool adaptive_quality_mode = false;
 
     // --- Argument Parsing ---
@@ -739,16 +739,16 @@ int main(int argc, char *argv[]) {
                 break;
             case 'm':
                 if (strcmp(optarg, "half") == 0) {
-                    g_render_mode = MODE_HALF;
+                    render_mode = MODE_HALF;
                 } else if (strcmp(optarg, "quadrant") == 0) {
-                    g_render_mode = MODE_QUADRANT;
+                    render_mode = MODE_QUADRANT;
                 } else {
                     fprintf(stderr, "ERROR: Unknown high-res mode '%s'. Use 'half' or 'quadrant'.\n", optarg);
                     return 1;
                 }
                 break;
             case 't':
-                g_render_tolerance_sq = atoi(optarg);
+                render_tolerance_sq = atoi(optarg);
                 break;
             case 'u':
                 unlimited_mode = true;
@@ -814,14 +814,14 @@ int main(int argc, char *argv[]) {
         int char_w, char_h;
         if (term_aspect_char > effective_aspect) { char_h = term_h; char_w = (int)round(term_h * effective_aspect); }
         else { char_w = term_w; char_h = (int)round(term_w / effective_aspect); }
-        switch (g_render_mode) {
+        switch (render_mode) {
             case MODE_FULL: render_w = char_w; render_h = char_h; break;
             case MODE_HALF: render_w = char_w; render_h = char_h * 2; break;
             case MODE_QUADRANT: render_w = char_w * 2; render_h = char_h * 2; break;
         }
     }
-    if (g_render_mode == MODE_HALF && render_h % 2 != 0) render_h--;
-    if (g_render_mode == MODE_QUADRANT) { if (render_w % 2 != 0) render_w--; if (render_h % 2 != 0) render_h--; }
+    if (render_mode == MODE_HALF && render_h % 2 != 0) render_h--;
+    if (render_mode == MODE_QUADRANT) { if (render_w % 2 != 0) render_w--; if (render_h % 2 != 0) render_h--; }
     if (render_w < 1) render_w = 1; if (render_h < 1) render_h = 1;
     player_state.render_w = render_w;
     player_state.render_h = render_h;
@@ -865,8 +865,9 @@ int main(int argc, char *argv[]) {
     }
 
     // --- Main Render Loop (Consumer) ---
-    buffer_append("\x1b[?25l\x1b[2J"); // Hide cursor, clear screen
-    buffer_flush();
+    TerminalContext term = {0};
+    buffer_append(&term, "\x1b[?25l\x1b[2J"); // Hide cursor, clear screen
+    buffer_flush(&term);
 
     struct timespec total_start_ts, total_end_ts;
     struct rusage start_usage, end_usage;
@@ -900,14 +901,14 @@ int main(int argc, char *argv[]) {
 
         if (should_time_frame) clock_gettime(CLOCK_MONOTONIC, &frame_start_ts);
 
-        g_cursor_row = 0; g_cursor_col = 0;
-        switch (g_render_mode) {
-            case MODE_FULL: render_frame_full_block(render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count); break;
-            case MODE_HALF: render_frame_half_block(render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count); break;
-            case MODE_QUADRANT: render_frame_quadrant(render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count); break;
+        term.cursor_row = 0; term.cursor_col = 0;
+        switch (render_mode) {
+            case MODE_FULL: render_frame_full_block(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance_sq); break;
+            case MODE_HALF: render_frame_half_block(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance_sq); break;
+            case MODE_QUADRANT: render_frame_quadrant(&term, render_w, render_h, q_frame->rgb_data, prev_rgb_buffer, frame_count, render_tolerance_sq); break;
         }
         memcpy(prev_rgb_buffer, q_frame->rgb_data, rgb_buffer_size);
-        buffer_flush();
+        buffer_flush(&term);
         frame_count++;
 
         if (should_time_frame) {
@@ -916,10 +917,10 @@ int main(int argc, char *argv[]) {
 
             if (adaptive_quality_mode && !unlimited_mode) {
                 if (render_duration > target_frame_time * 1.10) {
-                    g_render_tolerance_sq += 10;
+                    render_tolerance_sq += 10;
                 } else if (render_duration < target_frame_time * 0.90) {
-                    g_render_tolerance_sq -= 10;
-                    if (g_render_tolerance_sq < 0) g_render_tolerance_sq = 0;
+                    render_tolerance_sq -= 10;
+                    if (render_tolerance_sq < 0) render_tolerance_sq = 0;
                 }
             }
 
@@ -953,27 +954,26 @@ int main(int argc, char *argv[]) {
         pthread_join(audio_tid, NULL);
     }
 
-    buffer_append("\x1b[?25h\x1b[0m"); // Show cursor, reset attributes
-    if(show_stats) buffer_append("\n");
-    buffer_flush();
+    buffer_append(&term, "\x1b[?25h\x1b[0m\n"); // Show cursor, reset attributes
+    buffer_flush(&term);
 
     // --- Print Statistics ---
     if (show_stats) {
         double total_duration = get_time_diff(&total_start_ts, &total_end_ts);
         printf("--- Playback Statistics ---\n");
         const char* mode_str = "Full-Block (1x1)";
-        if (g_render_mode == MODE_HALF) mode_str = "Half-Block (1x2)";
-        else if (g_render_mode == MODE_QUADRANT) mode_str = "Quadrant (2x2)";
+        if (render_mode == MODE_HALF) mode_str = "Half-Block (1x2)";
+        else if (render_mode == MODE_QUADRANT) mode_str = "Quadrant (2x2)";
         printf("Render Mode:          %s\n", mode_str);
 
         int term_w = render_w, term_h = render_h;
-        if (g_render_mode == MODE_HALF) term_h /= 2;
-        else if (g_render_mode == MODE_QUADRANT) { term_w /= 2; term_h /= 2; }
+        if (render_mode == MODE_HALF) term_h /= 2;
+        else if (render_mode == MODE_QUADRANT) { term_w /= 2; term_h /= 2; }
         printf("Pixel/Char Size:      %dpx W x %dpx H -> %dch W x %dch H\n", render_w, render_h, term_w, term_h);
         if (adaptive_quality_mode)
             printf("Render Tolerance:     Adaptive\n");
         else
-            printf("Render Tolerance:     %d\n", g_render_tolerance_sq);
+            printf("Render Tolerance:     %d\n", render_tolerance_sq);
         printf("Playback Speed:       %s\n", unlimited_mode ? "Unlimited" : "Normal");
 
         if (frame_count > 0 && total_duration > 0) {
@@ -992,7 +992,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            double term_bw_mbps = (g_terminal_bytes_written / total_duration) * 8.0 / (1024 * 1024);
+            double term_bw_mbps = (term.bytes_written / total_duration) * 8.0 / (1024 * 1024);
             printf("Terminal Bandwidth:   %.2f Mbps\n", term_bw_mbps);
 
             long user_sec = end_usage.ru_utime.tv_sec - start_usage.ru_utime.tv_sec;
