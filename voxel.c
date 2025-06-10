@@ -7,10 +7,12 @@
  * Architecture:
  * - Demux/Decode Thread: Reads from the video file, decodes video frames,
  *   scales them to the target size, and places the final RGB buffer into a "full" queue.
- * - Audio Thread: Decodes audio packets and plays them using PulseAudio, updating a
- *   shared audio clock for A/V sync.
- * - Main (Render) Thread: Takes RGB buffers from the "full" queue, renders them to the
- *   terminal, and returns the used buffer to an "empty" queue for reuse.
+ * - Audio Thread: Decodes audio packets, synchronizes them against a master system clock,
+ *   and plays them using PulseAudio.
+ * - Main (Render) Thread: Takes RGB buffers from the "full" queue, synchronizes them
+ *   against the master clock, renders them to the terminal, and returns the used
+ *   buffer to an "empty" queue for reuse. This thread also implements a frame-dropping
+ *   mechanism to maintain sync if rendering falls behind.
  *
  * This producer-consumer model with a buffer pool minimizes memory allocations and
  * allows decoding/scaling to happen in parallel with rendering, maximizing performance.
@@ -481,10 +483,10 @@ typedef struct {
     int render_w, render_h;
 
     // A/V sync
-    volatile double audio_clock;
+    volatile double audio_clock; // Progress of audio stream (for stats)
     volatile bool quit;
     pa_simple *pa_s;
-    double video_start_time;
+    volatile double playback_start_time;
 
     // Queues for thread communication
     GenericQueue full_q;      // Populated QueuedFrame objects ready for rendering
@@ -574,17 +576,20 @@ void* decode_thread_func(void* arg) {
     return NULL;
 }
 
+// NEW: Forward declaration of get_master_clock for the audio thread
+static inline double get_master_clock(PlayerState *s);
+
 /**
  * The audio thread's job is to:
  * 1. Get an audio packet from the `audio_q`.
  * 2. Decode it, resample it to the format PulseAudio expects (S16LE).
- * 3. Write the samples to the PulseAudio stream.
- * 4. Update the shared `audio_clock` to keep A/V sync.
+ * 3. Synchronize against the master clock, waiting if audio is ahead of schedule.
+ * 4. Write the samples to the PulseAudio stream.
  */
-
 void* audio_thread_func(void* arg) {
     PlayerState* s = (PlayerState*)arg;
-    AVCodecParameters* a_codec_params = s->format_ctx->streams[s->audio_stream_idx]->codecpar;
+    AVStream* a_stream = s->format_ctx->streams[s->audio_stream_idx];
+    AVCodecParameters* a_codec_params = a_stream->codecpar;
     const AVCodec* a_codec = avcodec_find_decoder(a_codec_params->codec_id);
     AVCodecContext* a_codec_ctx = avcodec_alloc_context3(a_codec);
     avcodec_parameters_to_context(a_codec_ctx, a_codec_params);
@@ -602,8 +607,8 @@ void* audio_thread_func(void* arg) {
 
     AVFrame* frame = av_frame_alloc();
     AVPacket* pkt;
+    AVRational time_base = a_stream->time_base;
 
-    // --- Pre-allocate a reusable buffer for resampled audio data ---
     const int MAX_SAMPLES_PER_FRAME = 4096;
     int resampled_buffer_size = av_samples_get_buffer_size(NULL, pa_ss.channels, MAX_SAMPLES_PER_FRAME, AV_SAMPLE_FMT_S16, 1);
     uint8_t *resampled_buffer = av_malloc(resampled_buffer_size);
@@ -617,17 +622,32 @@ void* audio_thread_func(void* arg) {
         return NULL;
     }
 
-    // --- Main Packet Processing Loop ---
     while (!s->quit && queue_get(&s->audio_q, (void**)&pkt) == 0) {
         if (avcodec_send_packet(a_codec_ctx, pkt) == 0) {
             while (avcodec_receive_frame(a_codec_ctx, frame) == 0) {
-                // Safety check: ensure our pre-allocated buffer is large enough.
                 if (frame->nb_samples > MAX_SAMPLES_PER_FRAME) {
                     fprintf(stderr, "Warning: Audio frame has %d samples, exceeding pre-allocated max of %d. Skipping.\n", frame->nb_samples, MAX_SAMPLES_PER_FRAME);
                     continue;
                 }
 
-                // Resample directly into our reusable buffer.
+                // This logic slaves the audio playback to the master system clock.
+                if (frame->pts != AV_NOPTS_VALUE) {
+                    double audio_pts = frame->pts * av_q2d(time_base);
+                    double master_clock = get_master_clock(s);
+
+                    useconds_t latency_us = pa_simple_get_latency(s->pa_s, &pa_error);
+                    double latency_s = (latency_us == (useconds_t)-1) ? 0.0 : (double)latency_us / 1e6;
+
+                    double target_master_clock = audio_pts - latency_s;
+                    double delay = target_master_clock - master_clock;
+
+                    if (delay > 0.0) {
+                        struct timespec sleep_ts = { .tv_sec = (time_t)delay, .tv_nsec = (long)((delay - (time_t)delay) * 1e9) };
+                        nanosleep(&sleep_ts, NULL);
+                    }
+                    // If audio is late (delay < 0), we play it immediately to try and catch up.
+                }
+
                 int out_samples = swr_convert(swr_ctx, &resampled_buffer, frame->nb_samples, (const uint8_t **)frame->data, frame->nb_samples);
                 int out_buffer_size = av_samples_get_buffer_size(NULL, pa_ss.channels, out_samples, AV_SAMPLE_FMT_S16, 1);
                 pa_simple_write(pa_s, resampled_buffer, out_buffer_size, &pa_error);
@@ -637,17 +657,15 @@ void* audio_thread_func(void* arg) {
         av_packet_free(&pkt);
     }
 
-    // --- Flush the remaining frames from the codec ---
-    avcodec_send_packet(a_codec_ctx, NULL);
+    avcodec_send_packet(a_codec_ctx, NULL); // Flush codec
     while (avcodec_receive_frame(a_codec_ctx, frame) == 0) {
-        if (frame->nb_samples > MAX_SAMPLES_PER_FRAME) continue; // Same safety check
+        if (frame->nb_samples > MAX_SAMPLES_PER_FRAME) continue;
         int out_samples = swr_convert(swr_ctx, &resampled_buffer, frame->nb_samples, (const uint8_t **)frame->data, frame->nb_samples);
         int out_buffer_size = av_samples_get_buffer_size(NULL, pa_ss.channels, out_samples, AV_SAMPLE_FMT_S16, 1);
         pa_simple_write(pa_s, resampled_buffer, out_buffer_size, &pa_error);
         s->audio_clock += (double)frame->nb_samples / a_codec_ctx->sample_rate;
     }
 
-    // --- Free resources ---
     av_free(resampled_buffer);
     pa_simple_free(pa_s);
     s->pa_s = NULL;
@@ -692,25 +710,16 @@ void print_usage(const char *prog_name) {
 }
 
 static inline double get_master_clock(PlayerState *s) {
-    if (s->audio_stream_idx != -1) {
-        if (s->pa_s) {
-            int pa_error;
-            useconds_t latency = pa_simple_get_latency(s->pa_s, &pa_error);
-            if (latency == (useconds_t)-1) {
-                return s->audio_clock;
-            }
-            return s->audio_clock - (double)latency / 1e6;
-        }
-        return s->audio_clock;
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        double current_time = ts.tv_sec + ts.tv_nsec / 1e9;
-        if (s->video_start_time < 0) {
-            s->video_start_time = current_time;
-        }
-        return current_time - s->video_start_time;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double current_time = ts.tv_sec + ts.tv_nsec / 1e9;
+
+    if (s->playback_start_time < 0) {
+        s->playback_start_time = current_time;
+        return 0.0;
     }
+
+    return current_time - s->playback_start_time;
 }
 
 static void free_av_packet(void* item) {
@@ -787,6 +796,7 @@ int main(int argc, char *argv[]) {
     PlayerState player_state = {0};
     player_state.video_stream_idx = -1;
     player_state.audio_stream_idx = -1;
+    player_state.playback_start_time = -1.0;
     queue_init(&player_state.full_q);
     queue_init(&player_state.empty_q);
     queue_init(&player_state.frame_pool_q);
@@ -826,14 +836,14 @@ int main(int argc, char *argv[]) {
     player_state.render_w = render_w;
     player_state.render_h = render_h;
 
-    double target_frame_time = 0.0;
-    if (adaptive_quality_mode && !unlimited_mode) {
-        AVStream* v_stream = player_state.format_ctx->streams[player_state.video_stream_idx];
+    double video_frame_duration = 0.0;
+    AVStream* v_stream = player_state.format_ctx->streams[player_state.video_stream_idx];
+    if (!unlimited_mode) {
         double frame_rate = av_q2d(v_stream->avg_frame_rate);
         if (frame_rate > 0) {
-            target_frame_time = 1.0 / frame_rate;
-        } else {
-            adaptive_quality_mode = false; // Can't do adaptive without a frame rate
+            video_frame_duration = 1.0 / frame_rate;
+        } else { // Fallback, likely not work
+            video_frame_duration = 1.0 / 25.0;
         }
     }
 
@@ -858,7 +868,6 @@ int main(int argc, char *argv[]) {
 
     // --- Start Threads ---
     pthread_t decode_tid, audio_tid;
-    player_state.video_start_time = -1.0;
     pthread_create(&decode_tid, NULL, decode_thread_func, &player_state);
     if (player_state.audio_stream_idx != -1) {
         pthread_create(&audio_tid, NULL, audio_thread_func, &player_state);
@@ -880,14 +889,12 @@ int main(int argc, char *argv[]) {
             double master_clock = get_master_clock(&player_state);
             double delay = q_frame->pts - master_clock;
 
-            // Frame is too late, drop it and get the next one.
-            if (delay < -0.1) {
+            if (delay < -video_frame_duration) {
                 queue_put(&player_state.empty_q, q_frame->rgb_data);
                 queue_put(&player_state.frame_pool_q, q_frame);
                 continue;
             }
 
-            // Frame is early, wait
             if (delay > 0.0) {
                 struct timespec sleep_ts = {0};
                 sleep_ts.tv_sec = (time_t)delay;
@@ -915,10 +922,10 @@ int main(int argc, char *argv[]) {
             clock_gettime(CLOCK_MONOTONIC, &frame_end_ts);
             double render_duration = get_time_diff(&frame_start_ts, &frame_end_ts);
 
-            if (adaptive_quality_mode && !unlimited_mode) {
-                if (render_duration > target_frame_time * 1.10) {
+            if (adaptive_quality_mode && !unlimited_mode && video_frame_duration > 0) {
+                if (render_duration > video_frame_duration * 1.10) {
                     render_tolerance_sq += 10;
-                } else if (render_duration < target_frame_time * 0.90) {
+                } else if (render_duration < video_frame_duration * 0.90) {
                     render_tolerance_sq -= 10;
                     if (render_tolerance_sq < 0) render_tolerance_sq = 0;
                 }
