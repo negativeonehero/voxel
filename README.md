@@ -7,10 +7,12 @@ I compared Voxel vs. two other well-known solutions: [TheRealOrange/terminalvide
 |                |Setup                                     |Resolution               |FPS average/1% lows                              |
 |----------------|------------------------------------------|-------------------------|-------------------------------------------------|
 |mpv             |--vo=tct                                  |377x106 (1x2 half-block) |- (261/720 frames dropped)                       |
-|tvp             |color threshold 10, custom unlimited mode |377x106 (4x4 quarter)    |38.4 FPS/-                                       |
-|tvp             |color threshold 40, custom unlimited mode |377x106 (4x4 quarter)    |58.0 FPS/- (noticeable quality dropoff)          |
-|Voxel           |-t 10 -h quadrant -u                      |377x106 (2x2 quadrant)   |47.9 FPS/33.2 FPS                                |
-|Voxel           |-t 50 -h quadrant -u                      |377x106 (2x2 quadrant)   |**69.4** FPS/37.9 FPS (moderate quality dropoff) |
+|tvp             |color threshold 10, custom unlimited mode |377x106 (4x4 quarter)    |37.7 FPS/-                                       |
+|tvp             |color threshold 40, custom unlimited mode |377x106 (4x4 quarter)    |58.5 FPS/- (noticeable quality dropoff)          |
+|Voxel 1.1.0     |-d 3 -c 3 -m quarter -u                   |377x106 (4x4 quarter)    |51.2 FPS/32.2 FPS                                |
+|Voxel 1.1.0     |-d 8 -c 3 -m quarter -u                   |377x106 (4x4 quarter)    |69.3 FPS/32.8 FPS (moderate quality dropoff)     |
+|Voxel 1.1.0     |-d 3 -c 3 -m quadrant -u                  |377x106 (2x2 quadrant)   |58.1 FPS/33.1 FPS                                |
+|Voxel 1.1.0     |-d 8 -c 3 -m quadrant -u                  |377x106 (2x2 quadrant)   |**87.6** FPS/36.8 FPS (moderate quality dropoff) |
 
 It's fast. In fact, it can be as fast as you want*.
 
